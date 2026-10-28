@@ -5,6 +5,7 @@ import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
 from ..modules.transformer import TransformerBlock, ParallelDecoderBlock
+from ..util.pinned import PinnedPool
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
@@ -108,6 +109,7 @@ group.add_argument("--out_scales", type = str, default = "auto", choices = ["aut
 parser.add_argument("--override_anyway", action = "store_true", help = "Allow resuming even when overriding settings that will break the existing job.")
 
 num_ref_states = 5
+pinned_pool = PinnedPool(torch.cuda.is_available())
 
 progress_lock = threading.Lock()
 curr_progress = 0
@@ -947,6 +949,68 @@ def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0
     return passes
 
 
+class RowPipe:
+    """
+    Calibration rows to and from the GPU without stalling it. Each row's state is uploaded on a
+    side stream while the previous row computes, and results come back on a copy stream into
+    reused exact-size page-locked buffers, so later modules upload them asynchronously as well.
+    The per-row path (pageable upload, forward, pageable download) left the GPU idle most of the
+    time on large hidden states (an hc model's 4 x fp32 streams are 335 MB per 8k-token row).
+    Values are unchanged: only where and when they are copied.
+    """
+
+    def __init__(self, device, pool):
+        self.device = device
+        self.pool = pool
+        self.compute = torch.cuda.current_stream(device)
+        self.up = torch.cuda.Stream(device)
+        self.down = torch.cuda.Stream(device)
+
+    @staticmethod
+    def for_module(module, pool):
+        dev = module.device
+        if module.caps.get("prefer_cpu") or dev is None or torch.device(dev).type != "cuda":
+            return None
+        return RowPipe(torch.device(dev), pool)
+
+    def upload(self, t):
+        if t.device.type != "cpu" or not t.is_floating_point():
+            return t, None
+        self.up.wait_stream(self.compute)    # its memory may be recycled from compute's frees
+        with torch.cuda.stream(self.up):
+            x = t.to(self.device, non_blocking = True)
+        ev = torch.cuda.Event()
+        ev.record(self.up)
+        return x, ev
+
+    def rows(self, state, order, recycle = False):
+        """Yield (i, state on the device) for the rows in order, one upload ahead. recycle: the
+        caller replaces every yielded row's state with a download(), so each host state from an
+        earlier download() goes back to the pool; reuse is ordered after its upload"""
+        order = list(order)
+        nxt = self.upload(state[order[0]]) if order else None
+        for n, i in enumerate(order):
+            x, ev = nxt
+            nxt = self.upload(state[order[n + 1]]) if n + 1 < len(order) else None
+            if ev is not None:
+                self.compute.wait_event(ev)
+                x.record_stream(self.compute)
+                if recycle:
+                    self.pool.give([state[i]])
+            yield i, x
+
+    def download(self, x):
+        out = self.pool.empty(x.shape, x.dtype)
+        self.down.wait_stream(self.compute)
+        with torch.cuda.stream(self.down):
+            out.copy_(x, non_blocking = True)
+        x.record_stream(self.down)
+        return out
+
+    def finish(self):
+        self.down.synchronize()
+
+
 def discard_ok(module):
     """Whether an all-experts capture may skip the routed experts' output (capture_discard). In
     the standard blocks the MLP output only reaches the residual (through norms and
@@ -973,11 +1037,11 @@ def capture_module_serial(
     capture_H = {}
     capture_sens = {}
     ref_states = {}
+    todo = [i for i in range(len(state)) if i not in bad_rows]
+    pipe = RowPipe.for_module(module, pinned_pool)
     with ProgressBar(title, len(state)) as progress:
-        for i in range(len(state)):
+        for i, x in (pipe.rows(state, todo) if pipe else ((i, state[i]) for i in todo)):
             progress.update(i)
-            if i in bad_rows:
-                continue
             params = {
                 "attn_mode": "flash_attn_nc",
                 "capture": capture_H,
@@ -994,9 +1058,10 @@ def capture_module_serial(
             if slicing:
                  params["q_mlp_slice"] = current_slice
             get_preserve(i, params)
-            rs = module.prepare_for_device(state[i], params)
+            rs = module.prepare_for_device(x, params)
             rs = module.forward(rs, params)
             put_preserve(i, params)
+            del x
             if ref_pass and i < num_ref_states:
                 if model.calibration_all_experts:
                     # Do not activate all experts for reference state, for error measurement
@@ -1656,26 +1721,36 @@ def main(args, job_state):
                 check_bad_rows(bad_rows, len(state))
             else:
                 num_measured = 0
+                last = idx >= len(model.modules) - 1
+                # The last module only forwards the reference rows
+                todo = [i for i in range(len(state)) if i not in bad_rows and (i < num_ref_states or not last)]
+                pipe = RowPipe.for_module(module, pinned_pool)
+                finite_flags = []
                 with ProgressBar(f" -- Forward pass: {module.key}", len(state)) as progress:
-                    for i in range(len(state)):
+                    for i, x in (pipe.rows(state, todo, recycle = True) if pipe else ((i, state[i]) for i in todo)):
                         progress.update(i)
-                        if i in bad_rows:
-                            continue
                         params = {
                             "attn_mode": "flash_attn_nc",
                             "input_ids": original_input_ids[i],
                         }
-                        state[i] = module.prepare_for_device(state[i], params)
-                        if i < num_ref_states or idx < len(model.modules) - 1:
-                            get_preserve(i, params)
-                            rs = module.forward(state[i], params)
+                        x = module.prepare_for_device(x, params)
+                        get_preserve(i, params)
+                        rs = module.forward(x, params)
+                        if i < num_ref_states:
+                            # Reference rows are measured below: check them now
                             if not torch.isfinite(rs).all().item():
                                 bad_rows.add(i)
                                 print(f" !! Non-finite hidden state in calibration row {i}, excluding row")
-                            state[i] = rs.cpu()
-                            put_preserve(i, params)
+                        else:
+                            # Checked once per module: a per-row check waited on the GPU every row
+                            finite_flags.append((i, torch.isfinite(rs).all()))
+                        state[i] = pipe.download(rs) if pipe else rs.cpu()
+                        put_preserve(i, params)
+                        del x, rs
                         ref = ref_states.get(i) if i < num_ref_states else None
                         if ref is not None and len(linears) and i not in bad_rows:
+                            if pipe:
+                                pipe.finish()
                             ref = ref.to(state[i].device)
                             rfn, cos, sq = get_state_error(state[i], ref)
                             error += rfn
@@ -1683,6 +1758,13 @@ def main(args, job_state):
                             sqnr_ += sq
                             num_measured += 1
                             ref_states[i] = None
+                if pipe:
+                    pipe.finish()
+                if finite_flags:
+                    for (i, _), ok in zip(finite_flags, torch.stack([f for _, f in finite_flags]).tolist()):
+                        if not ok:
+                            bad_rows.add(i)
+                            print(f" !! Non-finite hidden state in calibration row {i}, excluding row")
                 n = max(num_measured, 1)
                 error /= n
                 cos_error /= n
