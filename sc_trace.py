@@ -1,5 +1,11 @@
 import sys, os
 
+# Unquantized MoE experts run through the sync-free Triton decode path (modules/moe_fp16_decode.py) unless
+# EXL3_MOE_DECODE=0 is set. It needs a whole layer's experts on one device (a layer split, not
+# tensor-parallel expert slices: those keep the per-expert loop), so it stays off for -tp. Read at import
+if "-tp" not in sys.argv and "--tensor_parallel" not in sys.argv:
+    os.environ.setdefault("EXL3_MOE_DECODE", "1")
+
 import argparse
 import json
 import hashlib

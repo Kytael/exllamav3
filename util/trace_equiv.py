@@ -106,8 +106,12 @@ def main(args):
                 worst.append((kl, j, step, d))
         def stats(v):
             v = sorted(v)
+            small = [x for x in v if x <= 1e-4]
+            # Positions with KL above 1e-4 are discrete events (a router's top-k choice or a sparse
+            # selection flips between the two paths); they carry most of the mean
             return dict(n = len(v), mean = sum(v) / max(len(v), 1), median = v[len(v) // 2] if v else 0.0,
-                        p99 = v[int(0.99 * len(v))] if v else 0.0, max = v[-1] if v else 0.0)
+                        p99 = v[int(0.99 * len(v))] if v else 0.0, max = v[-1] if v else 0.0,
+                        n_gt_1e4 = len(v) - len(small), mean_without_them = sum(small) / max(len(small), 1))
         allv = kl_p + kl_d
         worst.sort(reverse = True)
         return dict(prefill_last_token = stats(kl_p), decode = stats(kl_d), all = stats(allv),

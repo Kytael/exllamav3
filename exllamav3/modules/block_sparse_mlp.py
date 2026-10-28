@@ -1486,13 +1486,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if MOE_DECODE_GRAPH and self.decode_graphs is None:
                 self.decode_graphs = GraphSet()
             run_decode = self.decode_graphs.run if MOE_DECODE_GRAPH else fp16_moe_decode
-            final_hidden_states = run_decode(
-                y, selected_experts, routing_weights, gw[0], gw[1], gw[2],
-                self.activation_fn_call if self.gated else None, self.act_limit, self.interm_dtype,
-                self.ups[0].inner.out_dtype or torch.half,
-                (self.gates[0].inner.out_dtype or torch.half) if self.gated else None,
-                self.downs[0].inner.out_dtype or torch.half, self.gated, self.gateless_act,
-            ).reshape(eshape)
+            # Triton and graph capture act on the current device: this module's device under a layer split
+            with torch.cuda.device(y.device):
+                final_hidden_states = run_decode(
+                    y, selected_experts, routing_weights, gw[0], gw[1], gw[2],
+                    self.activation_fn_call if self.gated else None, self.act_limit, self.interm_dtype,
+                    self.ups[0].inner.out_dtype or torch.half,
+                    (self.gates[0].inner.out_dtype or torch.half) if self.gated else None,
+                    self.downs[0].inner.out_dtype or torch.half, self.gated, self.gateless_act,
+                )
+            final_hidden_states = final_hidden_states.reshape(eshape)
 
         # Torch/C++/fused path
         elif (
