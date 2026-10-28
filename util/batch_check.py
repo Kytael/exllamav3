@@ -35,13 +35,22 @@ def main(args):
     def run(x, params, i):
         # The head only sees the compared tokens: full-length logits for every row would not fit
         if i == len(mods) - 1 and x.is_floating_point():
-            x = x[:, : args.head_tokens]
+            x = x[:, : args.head_tokens].contiguous()
         x = mods[i].prepare_for_device(x, params)
         torch.cuda.synchronize()
         t = time.perf_counter()
         y = mods[i].forward(x, params)
         torch.cuda.synchronize()
         return y, time.perf_counter() - t
+
+    # Warm-up: first calls pay for kernel loading and library initialization
+    x, params = ids[:1], {"input_ids": ids[:1]}
+    for i in range(len(mods)):
+        x, _ = run(x, params, i)
+    x, params = ids, {"input_ids": ids}
+    for i in range(len(mods)):
+        x, _ = run(x, params, i)
+    del x
 
     # One row at a time, keeping every module's output (the last module only for its first chunk)
     single, t_single = [[] for _ in mods], [0.0] * len(mods)
