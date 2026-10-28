@@ -1,4 +1,5 @@
 import sys, os
+import threading
 
 import argparse
 import json
@@ -78,26 +79,76 @@ class ModuleRunner:
         self.modules = modules
         self.device = device
         self.streaming = streaming
+        self.ahead = None     # (idx, thread, result) of a module loading in the background
+
+    def _load(self, mod):
+        defer = mod.can_defer_load()
+        if defer:
+            self.config.stc.begin_deferred_load()
+        try:
+            mod.load("cpu" if mod.caps.get("prefer_cpu") else self.device)
+            if defer:
+                self.config.stc.end_deferred_load()
+        except BaseException:
+            if defer:
+                self.config.stc.abort_deferred_load()
+            raise
+
+    def prefetch(self, idx):
+        """Streaming: start loading module idx in a background thread on a side stream, so its
+        weights stream in while the current module computes (the loader reads with the GIL
+        released). loaded(idx) then waits for it instead of loading. One module ahead at most"""
+        if not self.streaming or self.ahead is not None or not (0 <= idx < len(self.modules)):
+            return
+        mod = self.modules[idx]
+        if mod.caps.get("prefer_cpu") or self.device.type != "cuda":
+            return
+        result = {}
+        def work():
+            try:
+                stream = torch.cuda.Stream(self.device)
+                with torch.cuda.device(self.device), torch.cuda.stream(stream):
+                    self._load(mod)
+                    result["event"] = torch.cuda.Event()
+                    result["event"].record(stream)
+            except BaseException as e:
+                result["error"] = e
+        thread = threading.Thread(target = work, daemon = True)
+        thread.start()
+        self.ahead = (idx, thread, result)
+
+    def _join_ahead(self):
+        """Wait for the background load; returns (idx, result) or None"""
+        if self.ahead is None:
+            return None
+        idx, thread, result = self.ahead
+        thread.join()
+        self.ahead = None
+        return idx, result
 
     @contextmanager
     def loaded(self, idx):
         mod = self.modules[idx]
         try:
             if self.streaming:
-                defer = mod.can_defer_load()
-                if defer:
-                    self.config.stc.begin_deferred_load()
-                try:
-                    mod.load("cpu" if mod.caps.get("prefer_cpu") else self.device)
-                    if defer:
-                        self.config.stc.end_deferred_load()
-                except BaseException:
-                    if defer:
-                        self.config.stc.abort_deferred_load()
-                    raise
+                done = self._join_ahead()
+                if done is not None and done[0] == idx and "error" not in done[1]:
+                    torch.cuda.current_stream(self.device).wait_event(done[1]["event"])
+                else:
+                    if done is not None:
+                        # A prefetch of another module (or a failed one): drop it, load this one
+                        if "error" not in done[1]:
+                            self.modules[done[0]].unload()
+                    self._load(mod)
             yield mod
         finally:
             if self.streaming:
+                # Keep a prefetch running across the unload only once it has finished with the
+                # loader, and let compute finish with this module's memory before freeing it
+                ahead = self.ahead
+                if ahead is not None:
+                    ahead[1].join()
+                torch.cuda.current_stream(self.device).synchronize()
                 mod.unload()
                 g_tensor_cache.drop_all()
 
@@ -467,6 +518,7 @@ def main(args):
             for i in range(num_mods):
                 boundary[i] = states
                 with runner.loaded(i) as mod:
+                    runner.prefetch(i + 1)
                     states = runner.rows(
                         mod, states, ids = row_groups,
                         consume=(lambda r, x: logits.append(to_host_pinned(x)))
@@ -835,6 +887,7 @@ def main(args):
                 print(f" -- [pass {pass_no + 1}/{len(passes)}] module {idx + 1}/{num_mods}: "
                       f"{len(pending)} pending, {len(spawn)} new tensor(s)")
                 with runner.loaded(idx) as mod:
+                    runner.prefetch(idx + 1)
 
                     def run(states):
                         """Forward rows through the loaded module: (states, None), or
