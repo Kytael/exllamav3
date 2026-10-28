@@ -545,8 +545,32 @@ def main(args):
         buf.copy_(x)
         return buf
 
+    ref_dev = None     # reference logits copied to the GPU while there is room for them
+
+    def stage_refs():
+        """Copy every row's reference logits to the GPU if they fit beside the work (8 GB at
+        8 rows of 2,048 tokens and a 248k vocab), so measurements stop re-uploading them once per
+        experiment. Streaming stages them while the head is the only module loaded; resident mode
+        once, if the model leaves room. Same data either way, so results are unchanged"""
+        nonlocal ref_dev
+        if ref_dev is not None or device.type != "cuda" or not ref_logits:
+            return
+        need = sum(t.numel() * t.element_size() for t in ref_logits)
+        free, total = torch.cuda.mem_get_info(device)
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        if free - need < max(8 << 30, total // 4):
+            return
+        ref_dev = [t.to(device, non_blocking = True) for t in ref_logits]
+
+    def unstage_refs():
+        nonlocal ref_dev
+        ref_dev = None
+
+    def ref_at(r):
+        return ref_logits[r] if ref_dev is None else ref_dev[r]
+
     def row_kld(r, x):
-        ref = ref_logits[r]
+        ref = ref_at(r)
         kl_vocab = min(vocab_size, x.shape[-1], ref.shape[-1])
         x2 = x.reshape(-1, x.shape[-1])
         ref2 = ref.reshape(-1, ref.shape[-1])
@@ -581,7 +605,7 @@ def main(args):
                 if collect_states and i == start_idx:
                     out_states.append(x.clone())
             for xb in head_rows(x, row_groups[g]):
-                ref = ref_logits[r]
+                ref = ref_at(r)
                 r += 1
                 kl_vocab = min(vocab_size, xb.shape[-1], ref.shape[-1])
                 # Chunk over tokens: full-vocab fp32 logits can be GBs
@@ -728,6 +752,8 @@ def main(args):
     save()
     print(" -- Reference pass")
     boundary, ref_logits = ref_pass()
+    if not streaming:
+        stage_refs()
 
     @torch.inference_mode()
     def perturb_iid(lin, rfn, seed):
@@ -1047,6 +1073,9 @@ def main(args):
                         del capture
                         lap("capture")
 
+                    if last_mod:
+                        stage_refs()
+
                     # Advance pending states through the unperturbed module; each experiment's old
                     # buffers then hold the next experiment's outputs
                     for exp in pending:
@@ -1083,6 +1112,7 @@ def main(args):
                         del v
                     shaping.clear()
                     lap("spawn")
+                    unstage_refs()
                 print(f"    time: load wait {runner.take_wait():.2f} s, " +
                       ", ".join(f"{k} {v:.2f} s" for k, v in phase.items()))
 
