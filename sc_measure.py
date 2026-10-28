@@ -1,5 +1,8 @@
 import sys, os
+import mmap
 import threading
+import time
+import weakref
 
 import argparse
 import json
@@ -70,16 +73,76 @@ Not validated on MoE models.
 # TODO: Rethink
 
 
+class _LockedMemory(mmap.mmap):
+    """Anonymous memory registered with the CUDA driver (page-locked) for as long as it lives.
+    torch.frombuffer keeps it alive while any tensor views it; it is unregistered just before it is
+    unmapped"""
+    ptr = None
+
+    def __del__(self):
+        if self.ptr is not None:
+            torch.cuda.cudart().cudaHostUnregister(self.ptr)
+
+
+class PinnedPool:
+    """Exact-size page-locked host buffers, handed out again by size once given back. torch's
+    pinned allocator rounds every block up to a power of two, so a 671 MB state takes 1 GiB of
+    locked RAM and a 1.02 GB row of reference logits takes 2 GiB: nearly half the RAM a pass could
+    use. Buffers nobody gives back are freed as usual when their last view goes. Pageable (only
+    slower to copy) if registering fails"""
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self.free = defaultdict(list)                # nbytes -> buffers given back
+        self.live = weakref.WeakValueDictionary()    # data_ptr -> buffer
+
+    def empty(self, shape, dtype):
+        n = math.prod(shape) * dtype.itemsize
+        if not self.enabled or n == 0:
+            return torch.empty(shape, dtype = dtype)
+        if self.free[n]:
+            mem = self.free[n].pop()
+        else:
+            mem = _LockedMemory(-1, n)
+            ptr = torch.frombuffer(mem, dtype = torch.uint8).data_ptr()
+            try:
+                cudart = torch.cuda.cudart()
+                ok = cudart.cudaHostRegister(ptr, n, 0) == cudart.cudaError.success
+            except Exception:
+                ok = False
+            if not ok:
+                self.enabled = False
+                return torch.empty(shape, dtype = dtype)
+            mem.ptr = ptr
+            self.live[ptr] = mem
+        return torch.frombuffer(mem, dtype = torch.uint8).view(dtype).view(shape)
+
+    def give(self, tensors):
+        """Return whole buffers from empty() for reuse (anything else is ignored). The caller
+        guarantees no unfinished copy still uses them, or that later copies into them are ordered
+        after it on the same streams"""
+        for t in tensors if isinstance(tensors, (list, tuple)) else ():
+            mem = self.live.get(t.data_ptr()) if t.device.type == "cpu" else None
+            if mem is not None and t.numel() * t.element_size() == len(mem):
+                self.free[len(mem)].append(mem)
+
+
 class ModuleRunner:
     """Run rows through one module at a time. Clone states because modules may mutate inputs,
     including modules that run on CPU."""
 
-    def __init__(self, config, modules, device, streaming):
+    def __init__(self, config, modules, device, streaming, pool):
         self.config = config
         self.modules = modules
         self.device = device
         self.streaming = streaming
+        self.pool = pool
         self.ahead = None     # (idx, thread, result) of a module loading in the background
+        self.wait_s = 0.0     # time spent waiting for module loads since the last take_wait()
+
+    def take_wait(self):
+        w, self.wait_s = self.wait_s, 0.0
+        return w
 
     def _load(self, mod):
         defer = mod.can_defer_load()
@@ -131,6 +194,7 @@ class ModuleRunner:
         mod = self.modules[idx]
         try:
             if self.streaming:
+                t0 = time.perf_counter()
                 done = self._join_ahead()
                 if done is not None and done[0] == idx and "error" not in done[1]:
                     torch.cuda.current_stream(self.device).wait_event(done[1]["event"])
@@ -140,6 +204,7 @@ class ModuleRunner:
                         if "error" not in done[1]:
                             self.modules[done[0]].unload()
                     self._load(mod)
+                self.wait_s += time.perf_counter() - t0
             yield mod
         finally:
             if self.streaming:
@@ -184,7 +249,7 @@ class ModuleRunner:
                 if consume is not None:
                     consume(r, x)
                 elif copy_stream is not None:
-                    out = torch.empty(x.shape, dtype = x.dtype, pin_memory = True)
+                    out = self.pool.empty(x.shape, x.dtype)
                     copy_stream.wait_stream(torch.cuda.current_stream(self.device))
                     with torch.cuda.stream(copy_stream):
                         out.copy_(x, non_blocking = True)
@@ -426,7 +491,8 @@ def main(args):
         if streaming:
             torch.cuda.empty_cache()
             print(" -- Full-model load exceeded VRAM; switching to layer streaming")
-    runner = ModuleRunner(config, model.modules, device, streaming)
+    pinned = PinnedPool(device.type == "cuda")
+    runner = ModuleRunner(config, model.modules, device, streaming, pinned)
 
     total_rows = args.rows + (args.h_rows if args.shaped else 0)
     if args.trace:
@@ -475,10 +541,7 @@ def main(args):
         link speed (a row's reference logits are length x vocab x 2 bytes: 1 GB at 2,048 tokens
         and a 248k vocab, uploaded once per perturbed row). Pageable if pinning fails"""
         x = x.half()
-        try:
-            buf = torch.empty(x.shape, dtype = torch.half, pin_memory = True)
-        except RuntimeError:
-            return x.to("cpu", copy = True)
+        buf = pinned.empty(x.shape, torch.half)
         buf.copy_(x)
         return buf
 
@@ -927,6 +990,15 @@ def main(args):
                       f"{len(pending)} pending, {len(spawn)} new tensor(s)")
                 with runner.loaded(idx) as mod:
                     runner.prefetch(idx + 1)
+                    t_mod = time.perf_counter()
+                    phase = {}
+
+                    def lap(name):
+                        nonlocal t_mod
+                        torch.cuda.synchronize(device)
+                        t = time.perf_counter()
+                        phase[name] = phase.get(name, 0.0) + t - t_mod
+                        t_mod = t
 
                     def run(states):
                         """Forward rows through the loaded module: (states, None), or
@@ -949,10 +1021,16 @@ def main(args):
                         if spawn:
                             shaping = finalize_shaping(idx, capture)
                         del capture
+                        lap("capture")
 
-                    # Advance pending states through the unperturbed module
+                    # Advance pending states through the unperturbed module; each experiment's old
+                    # buffers then hold the next experiment's outputs
                     for exp in pending:
-                        exp["states"], exp["kld"] = run(exp["states"])
+                        old = exp["states"]
+                        exp["states"], exp["kld"] = run(old)
+                        pinned.give(old)
+                        del old
+                    lap("advance")
 
                     if spawn:
                         states, kld = run(boundary[idx])
@@ -980,6 +1058,9 @@ def main(args):
                     for v in shaping.values():
                         del v
                     shaping.clear()
+                    lap("spawn")
+                print(f"    time: load wait {runner.take_wait():.2f} s, " +
+                      ", ".join(f"{k} {v:.2f} s" for k, v in phase.items()))
 
             # Check controls and save the completed pass
             for exp in pending:
