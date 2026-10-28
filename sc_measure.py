@@ -239,6 +239,42 @@ def estimate_resident_bytes(modules, rows, length, vocab_size, shaped, h_rows, s
     return math.ceil(1.15 * (weights + states + logits + workspace))
 
 
+class SpilledStates:
+    """One module's boundary states (a tensor per row group) kept in files under a spill directory
+    instead of host memory. Streaming mode holds every module's boundary for the whole run (53
+    modules x 0.67 GB on the harness model at -r 8 -l 2048), more than a 64 GB host can spare next
+    to the pending experiment states; each is read back only when its module is perturbed. Reading
+    yields fresh host tensors, so callers may not mutate shared state by accident"""
+
+    def __init__(self, tensors, path):
+        os.makedirs(path, exist_ok = True)
+        self.meta = []
+        for k, t in enumerate(tensors):
+            t = t.contiguous()
+            f = os.path.join(path, f"{k}.bin")
+            t.view(torch.uint8).view(-1).numpy().tofile(f)
+            self.meta.append((f, tuple(t.shape), t.dtype, t.numel() * t.element_size()))
+
+    def __len__(self):
+        return len(self.meta)
+
+    def __getitem__(self, k):
+        f, shape, dtype, nbytes = self.meta[k]
+        return torch.from_file(f, shared = False, size = nbytes, dtype = torch.uint8).view(dtype).view(shape)
+
+    def __iter__(self):
+        return (self[k] for k in range(len(self)))
+
+    def nbytes(self):
+        return sum(m[3] for m in self.meta)
+
+
+def states_nbytes(states):
+    if isinstance(states, SpilledStates):
+        return states.nbytes()
+    return sum(t.numel() * t.element_size() for t in states)
+
+
 def sysmem_budget(max_sys_gb):
     """Pending-state budget in bytes; default to half the RAM available after the reference pass"""
     if max_sys_gb is not None:
@@ -517,6 +553,9 @@ def main(args):
             states = row_groups
             for i in range(num_mods):
                 boundary[i] = states
+                if args.spill_dir and i > 0:
+                    # The in-memory tensors still feed this module; the boundary keeps only files
+                    boundary[i] = SpilledStates(states, os.path.join(args.spill_dir, f"boundary-{i}"))
                 with runner.loaded(i) as mod:
                     runner.prefetch(i + 1)
                     states = runner.rows(
@@ -861,7 +900,7 @@ def main(args):
         todo_by_idx = {idx: ts for idx, ts in todo_by_idx.items() if ts}
         measurements_by_idx = {idx: 1 + sum(len(measurement_plan(t)) for t in ts)
                               for idx, ts in todo_by_idx.items()}
-        state_bytes = max((sum(t.numel() * t.element_size() for t in states)
+        state_bytes = max((states_nbytes(states)
                            for states in boundary[1:]), default = 0)
         budget = sysmem_budget(args.max_sys)
         passes = plan_fanout_passes(measurements_by_idx, state_bytes, budget)
@@ -1058,6 +1097,9 @@ if __name__ == "__main__":
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
+    parser.add_argument("--spill-dir", dest = "spill_dir", type = str, default = None,
+                        help = "Streaming: keep boundary states in files under this directory (a fast local disk) "
+                               "instead of host memory, for hosts with less RAM than the boundaries need. Files are left in place")
     parser.add_argument("-br", "--batch-rows", dest = "batch_rows", type = int, default = 1,
                         help = "Forward up to N equal-length rows together (the head still runs per row). "
                                "Faster where per-row forwards are launch-bound; costs activation memory. Default: 1")
