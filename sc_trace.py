@@ -639,6 +639,26 @@ def main(args):
     # Throughput accounting. A decode-only iteration is one with every active job past prefill and
     # nothing pending: a pure batched single-token step, whose rate is the number to compare
     conversations = CONVERSATIONS[:args.num_convs] if args.num_convs else CONVERSATIONS
+    cpu_prof, prof_on = {}, [False]
+    if args.cpu_profile:
+        # Host time inside every module's forward during decode-only iterations: with the GPU running
+        # ahead this is the launch cost the CPU pays per step (nested modules include their children)
+        def _walk(m):
+            yield m
+            for c in getattr(m, "modules", None) or []:
+                yield from _walk(c)
+        for m in _walk(model):
+            def _wrap(orig, cls):
+                def timed(*a, **k):
+                    if not prof_on[0]:
+                        return orig(*a, **k)
+                    t0 = time.perf_counter()
+                    r = orig(*a, **k)
+                    e = cpu_prof.setdefault(cls, [0.0, 0])
+                    e[0] += time.perf_counter() - t0; e[1] += 1
+                    return r
+                return timed
+            m.forward = _wrap(m.forward, type(m).__name__)
     st = dict(dec_s = 0.0, dec_tok = 0, dec_iters = 0, dec_bsz = 0, all_s = 0.0, all_tok = 0, it_ms = [])
 
     def total_packed():
@@ -684,7 +704,9 @@ def main(args):
                 dec_only = bool(act) and not generator.pending_jobs and all(j.is_prefill_done() for j in act)
                 n_act = len(act)
                 it_t0 = time.perf_counter()
+                prof_on[0] = dec_only
                 it_results = generator.iterate()
+                prof_on[0] = False
                 it_dt = time.perf_counter() - it_t0
                 it_tok = sum(r["token_ids"].shape[-1] for r in it_results if r["stage"] == "streaming" and "token_ids" in r)
                 st["all_s"] += it_dt; st["all_tok"] += it_tok
@@ -771,7 +793,9 @@ def main(args):
                     dec_only = bool(act) and not generator.pending_jobs and all(j.is_prefill_done() for j in act)
                     n_act = len(act)
                     it_t0 = time.perf_counter()
+                    prof_on[0] = dec_only
                     it_results = generator.iterate()
+                    prof_on[0] = False
                     it_dt = time.perf_counter() - it_t0
                     it_tok = sum(r["token_ids"].shape[-1] for r in it_results
                                  if r["stage"] == "streaming" and "token_ids" in r)
@@ -839,6 +863,12 @@ def main(args):
           f"step_ms_median {ms[len(ms) // 2] if ms else 0:.1f} step_ms_p90 {ms[9 * len(ms) // 10] if ms else 0:.1f} "
           f"all_tok_per_s {st['all_tok'] / max(st['all_s'], 1e-9):.1f} hash {h.hexdigest()[:16]}")
 
+    if args.cpu_profile and st["dec_iters"]:
+        n = st["dec_iters"]
+        for cls, (tot, calls) in sorted(cpu_prof.items(), key = lambda kv: -kv[1][0]):
+            print(f"TRACECPU {cls:28} {tot / n * 1000:8.3f} ms per decode step  {calls / n:6.1f} calls per step  "
+                  f"{tot / max(calls, 1) * 1e6:8.1f} us per call")
+
     # qbench-compatible trace
     out = {
         "model": args.model_dir,
@@ -888,6 +918,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 3072, help = "Per-turn generation cap, default: 3072")
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
+    parser.add_argument("--cpu_profile", action = "store_true", help = "Report host time per module class per decode step")
     parser.add_argument("--continuous", action = "store_true", help = "No wave barriers: conversations advance independently and epochs overlap (see --epochs_in_flight)")
     parser.add_argument("--epochs_in_flight", type = int, default = 2, help = "With --continuous: epochs running together, default: 2")
     parser.add_argument("--num_convs", type = int, default = None, help = "Use only the first N seed conversations (benchmarking: sets the concurrency of a wave)")

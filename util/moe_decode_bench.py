@@ -27,6 +27,10 @@ def silu_mul(g, u, a, limit):
     ext.silu_mul(g, u, a, limit)
 
 
+def relu2(x):
+    return torch.square(F.relu(x))
+
+
 def loop_ref(y, sel, w, wg, wu, wd, E, fp32 = False):
     """The dense loop: host readback of the counts, per active expert index_select, three GEMMs,
     activation, routing weight, fp32 index_add_ (experts in ascending order)"""
@@ -46,6 +50,18 @@ def loop_ref(y, sel, w, wg, wu, wd, E, fp32 = False):
         ww = ws[start:start + c].unsqueeze(1)
         start += c
         xc = y.index_select(0, top)
+        if wg is None:          # gateless relu2 experts (up and down only)
+            if fp32:
+                d = relu2(xc.float() @ wu[e].float()) @ wd[e].float() * ww.float()
+            else:
+                u = torch.empty((c, wu.shape[2]), dtype = torch.half, device = y.device)
+                torch.matmul(xc, wu[e], out = u)
+                a = relu2(u)
+                d = torch.empty((c, wd.shape[2]), dtype = torch.float, device = y.device)
+                ext.hgemm(a, wd[e], d)
+                d.mul_(ww)
+            out.index_add_(0, top, d)
+            continue
         if fp32:
             xf = xc.float()
             d = (F.silu(xf @ wg[e].float()) * (xf @ wu[e].float())) @ wd[e].float()
@@ -93,7 +109,7 @@ def main(args):
                                           triton = HAVE_TRITON and __import__("triton").__version__)), flush = True)
     gen = torch.Generator(device = dev); gen.manual_seed(0)
     E, H, I, K = args.experts, args.hidden, args.inter, args.topk
-    sg = (torch.randn((E, H, I), generator = gen, device = dev) * H ** -0.5).half()
+    sg_full = sg = (torch.randn((E, H, I), generator = gen, device = dev) * H ** -0.5).half()
     su = (torch.randn((E, H, I), generator = gen, device = dev) * H ** -0.5).half()
     sd = (torch.randn((E, I, H), generator = gen, device = dev) * I ** -0.5).half()
     for skew in args.skew:
@@ -101,8 +117,13 @@ def main(args):
             y = torch.randn((T, H), generator = gen, device = dev).half()
             sel, w = route(T, E, K, skew, gen, dev)
             res = dict(tokens = T, skew = skew, assignments = T * K, active = int(torch.bincount(sel.reshape(-1), minlength = E).gt(0).sum()))
-            opt = lambda: fp16_moe_decode(y, sel, w, sg, su, sd, silu_mul, 0.0, torch.half, torch.half, torch.half,
-                                          torch.float, True)
+            if args.gateless:
+                opt = lambda: fp16_moe_decode(y, sel, w, None, su, sd, None, 0.0, torch.half, torch.half, None,
+                                              torch.float, False, relu2)
+            else:
+                opt = lambda: fp16_moe_decode(y, sel, w, sg, su, sd, silu_mul, 0.0, torch.half, torch.half, torch.half,
+                                              torch.float, True)
+            sg = None if args.gateless else sg_full
             ref = loop_ref(y, sel, w, sg, su, sd, E, fp32 = True)
             lp = loop_ref(y, sel, w, sg, su, sd, E)
             o = opt()
@@ -146,4 +167,5 @@ if __name__ == "__main__":
     ap.add_argument("--tokens", type = int, nargs = "+", default = [1, 8, 32, 128, 256, 1024, 2048])
     ap.add_argument("--skew", type = float, nargs = "+", default = [0.0, 1.0])
     ap.add_argument("--iters", type = int, default = 5)
+    ap.add_argument("--gateless", action = "store_true", help = "Gateless relu2 experts (up and down only)")
     main(ap.parse_args())

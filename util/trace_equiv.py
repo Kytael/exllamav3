@@ -50,6 +50,9 @@ def walk(m):
 
 @torch.inference_mode()
 def main(args):
+    if args.full_precision_reduction:
+        # torch.matmul (the loop's fp16-output gate/up GEMMs) may reduce split-K partials in fp16 by default
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     model, config, cache, tokenizer, _, _, _ = model_init.init(args)
     gen = Generator(model = model, cache = cache, tokenizer = tokenizer, max_chunk_size = 2048)
     moes = [m for m in walk(model) if isinstance(m, BlockSparseMLP)]
@@ -61,6 +64,7 @@ def main(args):
     print(f"TKL_INFO jobs {len(rows)} steps<= {args.steps}")
 
     def setmode(mode):
+        mode = "base" if mode == "base2" else mode      # base2: a second run of the loop, the determinism control
         for m, b in zip(moes, backends):
             m.grouped_backend = b if mode == "grp" else None
         mfd.RUNTIME_ON[0] = mode in ("opt", "gold")
@@ -111,7 +115,7 @@ def main(args):
                     worst5 = [dict(kl = w[0], job = w[1], step = w[2], max_abs_delta = w[3]) for w in worst[:5]])
 
     results = {}
-    order = [m for m in ("gold", "base", "grp", "opt") if m in passes]
+    order = [m for m in ("gold", "base", "base2", "grp", "opt") if m in passes]
     for i, pa in enumerate(order):
         for pb in order[i + 1:]:
             results[(pa, pb)] = compare(pa, pb)
@@ -133,4 +137,5 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type = int, default = 48)
     parser.add_argument("--modes", type = str, default = "base,grp,opt,gold")
     parser.add_argument("--max_mean_kl", type = float, default = 1e-5)
+    parser.add_argument("--full_precision_reduction", action = "store_true", help = "Disable fp16 reduced-precision split-K reductions in torch.matmul (the loop's gate/up GEMMs)")
     main(parser.parse_args())
