@@ -228,37 +228,70 @@ class ModuleRunner:
         dev = getattr(mod, "device", None)
         on_gpu = dev is not None and torch.device(dev).type == "cuda"
         copy_stream = torch.cuda.Stream(self.device) if on_gpu and consume is None else None
-        outputs, in_flight = [], []
-        r = 0
-        for g, state in enumerate(states):
-            gid = ids[g] if ids is not None else None
-            parts = [(state[b : b + 1], None if gid is None else gid[b : b + 1]) for b in range(state.shape[0])] \
-                if per_row else [(state, gid)]
-            for st, part_ids in parts:
-                params = {} if capture is None else {"capture": capture}
-                if part_ids is not None:
-                    params["input_ids"] = part_ids
-                # A fresh device copy protects the stored state from in-place edits; a module that
-                # runs on the CPU needs an explicit clone
-                if on_gpu and st.device.type == "cpu" and st.is_floating_point():
+        compute = torch.cuda.current_stream(self.device) if on_gpu else None
+        up_stream = torch.cuda.Stream(self.device) if on_gpu else None
+
+        # Work items in order: (group, row within it or None for the whole group, global row
+        # index). States are fetched one group at a time: spilled groups are read from disk
+        items, r = [], 0
+        for g in range(len(states)):
+            rows_g = states[g].shape[0] if not isinstance(states, SpilledStates) else states.meta[g][1][0]
+            for b in (range(rows_g) if per_row else [None]):
+                items.append((g, b, r))
+                r += 1 if per_row else rows_g
+        cached = [None, None]
+
+        def item_state(n):
+            g, b, _ = items[n]
+            if cached[0] != g:
+                cached[:] = [g, states[g]]
+            return cached[1] if b is None else cached[1][b : b + 1]
+
+        def item_ids(n):
+            g, b, _ = items[n]
+            if ids is None:
+                return None
+            return ids[g] if b is None else ids[g][b : b + 1]
+
+        def upload(st):
+            """Host states go up on their own stream, one item ahead of compute, so the copy
+            overlaps the previous item's forward. A fresh device copy also protects the stored
+            state from in-place edits; a module that runs on the CPU needs an explicit clone"""
+            if on_gpu and st.device.type == "cpu" and st.is_floating_point():
+                up_stream.wait_stream(compute)    # its memory may be recycled from compute's frees
+                with torch.cuda.stream(up_stream):
                     x = st.to(self.device, non_blocking = True)
-                else:
-                    x = st.clone()
-                x = mod.prepare_for_device(x, params)
-                x = mod.forward(x, params)
-                if consume is not None:
-                    consume(r, x)
-                elif copy_stream is not None:
-                    out = self.pool.empty(x.shape, x.dtype)
-                    copy_stream.wait_stream(torch.cuda.current_stream(self.device))
-                    with torch.cuda.stream(copy_stream):
-                        out.copy_(x, non_blocking = True)
-                    in_flight.append(x)
-                    outputs.append(out)
-                else:
-                    outputs.append(x.to("cpu", copy = True))
-                r += st.shape[0]
-                del x, params
+                ev = torch.cuda.Event()
+                ev.record(up_stream)
+                return x, ev
+            return st.clone(), None
+
+        outputs, in_flight = [], []
+        nxt = upload(item_state(0)) if items else None
+        for n, (_, _, r0) in enumerate(items):
+            part_ids = item_ids(n)
+            x, ev = nxt
+            nxt = upload(item_state(n + 1)) if n + 1 < len(items) else None
+            if ev is not None:
+                compute.wait_event(ev)
+                x.record_stream(compute)
+            params = {} if capture is None else {"capture": capture}
+            if part_ids is not None:
+                params["input_ids"] = part_ids
+            x = mod.prepare_for_device(x, params)
+            x = mod.forward(x, params)
+            if consume is not None:
+                consume(r0, x)
+            elif copy_stream is not None:
+                out = self.pool.empty(x.shape, x.dtype)
+                copy_stream.wait_stream(compute)
+                with torch.cuda.stream(copy_stream):
+                    out.copy_(x, non_blocking = True)
+                in_flight.append(x)
+                outputs.append(out)
+            else:
+                outputs.append(x.to("cpu", copy = True))
+            del x, params
         if copy_stream is not None:
             copy_stream.synchronize()
         del in_flight
@@ -1095,18 +1128,23 @@ def main(args):
                                 f"{lin.key}: expected unquantized (fp16) tensor, got {type(lin.inner).__name__}"
                         res = new_result(idx, target)
                         for li, rfn, draw in measurement_plan(target):
+                            lap("spawn")
                             saved, rfn_actual, w_norm, shaped_all = perturb_target(target, li, draw, shaping)
                             res["shaped"] = shaped_all
+                            lap("perturb")
                             try:
                                 states, kld = run(boundary[idx])
+                                lap("forward")
                             finally:
                                 # Restore before unloading, which discards lin.inner
                                 restore_target(target, saved)
+                            lap("restore")
                             pending.append(dict(
                                 res = res, rfn = rfn, rfn_actual = rfn_actual, draw = draw,
                                 w_norm = w_norm, inj_rfn = injected_rfn(states, idx),
                                 states = states, kld = kld,
                             ))
+                            lap("inj")
                         pass_results.append(res)
                     for v in shaping.values():
                         del v
