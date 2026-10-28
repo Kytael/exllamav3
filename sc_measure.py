@@ -217,14 +217,15 @@ class ModuleRunner:
                 mod.unload()
                 g_tensor_cache.drop_all()
 
-    def rows(self, mod, states, capture=None, consume=None, ids=None, per_row=False):
+    def rows(self, mod, states, capture=None, consume=None, ids=None, per_row=False, inspect=None):
         """states, ids: one entry per row group, (B, ...); ids are the rows' token ids, passed as
         params["input_ids"] (PLE layers read the token context from there; without it they run on
         a dummy all-zero history). per_row: forward each row of a group on its own (the LM head,
         whose full-vocab logits would not fit for a whole group); consume(r, x) then gets the
         global row index. Without consume, outputs come back as host tensors in page-locked
         memory: uploads and downloads run asynchronously, the downloads on a copy stream, so a
-        group's transfer overlaps the next group's compute"""
+        group's transfer overlaps the next group's compute. inspect(n, x), if given, sees each
+        item's device output before it is downloaded"""
         dev = getattr(mod, "device", None)
         on_gpu = dev is not None and torch.device(dev).type == "cuda"
         copy_stream = torch.cuda.Stream(self.device) if on_gpu and consume is None else None
@@ -280,6 +281,8 @@ class ModuleRunner:
                 params["input_ids"] = part_ids
             x = mod.prepare_for_device(x, params)
             x = mod.forward(x, params)
+            if inspect is not None:
+                inspect(n, x)
             if consume is not None:
                 consume(r0, x)
             elif copy_stream is not None:
@@ -580,6 +583,25 @@ def main(args):
 
     ref_dev = None     # reference logits copied to the GPU while there is room for them
 
+    def device_room(need):
+        """True if need bytes fit on the device with room left for the work"""
+        free, total = torch.cuda.mem_get_info(device)
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        return free - need >= max(8 << 30, total // 4)
+
+    def stage_states(states):
+        """Device copies of a module's boundary states if they fit, else the states as they are.
+        Every experiment spawned at a module starts from the same input and is compared with the
+        same clean output; staging them once saves a disk read (when spilled) and an upload per
+        experiment"""
+        if device.type != "cuda" or len(states) == 0:
+            return states
+        if not isinstance(states, SpilledStates) and not all(t.is_floating_point() for t in states):
+            return states     # token ids: the embedding may run on the CPU
+        if not device_room(states_nbytes(states)):
+            return states
+        return [t.to(device, non_blocking = True) for t in states]
+
     def stage_refs():
         """Copy every row's reference logits to the GPU if they fit beside the work (8 GB at
         8 rows of 2,048 tokens and a 248k vocab), so measurements stop re-uploading them once per
@@ -588,10 +610,7 @@ def main(args):
         nonlocal ref_dev
         if ref_dev is not None or device.type != "cuda" or not ref_logits:
             return
-        need = sum(t.numel() * t.element_size() for t in ref_logits)
-        free, total = torch.cuda.mem_get_info(device)
-        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
-        if free - need < max(8 << 30, total // 4):
+        if not device_room(sum(t.numel() * t.element_size() for t in ref_logits)):
             return
         ref_dev = [t.to(device, non_blocking = True) for t in ref_logits]
 
@@ -1083,14 +1102,14 @@ def main(args):
                         phase[name] = phase.get(name, 0.0) + t - t_mod
                         t_mod = t
 
-                    def run(states):
+                    def run(states, inspect = None):
                         """Forward rows through the loaded module: (states, None), or
                         (None, mean KL) on the last module"""
                         scores = []
                         out = runner.rows(
                             mod, states, ids = row_groups,
                             consume = (lambda r, x: scores.append(row_kld(r, x))) if last_mod else None,
-                            per_row = last_mod,
+                            per_row = last_mod, inspect = inspect,
                         )
                         return (None, sum(scores) / len(scores)) if last_mod else (out, None)
 
@@ -1119,9 +1138,26 @@ def main(args):
                         del old
                     lap("advance")
 
+                    spawn_in = clean_out = clean_sq = None
                     if spawn:
-                        states, kld = run(boundary[idx])
+                        spawn_in = boundary[idx] if mod.caps.get("prefer_cpu") else stage_states(boundary[idx])
+                        if not last_mod:
+                            clean_out = stage_states(boundary[idx + 1])
+                            # fp64 sum over groups in order, as injected_rfn adds them
+                            for c in clean_out:
+                                ri = c.float().square().sum().double().to(device)
+                                clean_sq = ri if clean_sq is None else clean_sq + ri
+                        states, kld = run(spawn_in)
                         pending.append(dict(control = idx, states = states, kld = kld))
+
+                    def inj_hook(acc):
+                        """Injected error from each group's device output, before its download:
+                        the same fp64 sums as injected_rfn without uploading the states again"""
+                        def hook(n, x):
+                            d = x.float() - clean_out[n].float().to(x.device)
+                            di = d.square().sum().double()
+                            acc[0] = di if acc[0] is None else acc[0] + di
+                        return hook
 
                     for target in spawn:
                         for lin in target.linears:
@@ -1133,16 +1169,21 @@ def main(args):
                             saved, rfn_actual, w_norm, shaped_all = perturb_target(target, li, draw, shaping)
                             res["shaped"] = shaped_all
                             lap("perturb")
+                            acc = [None]
                             try:
-                                states, kld = run(boundary[idx])
+                                states, kld = run(spawn_in, inspect = None if last_mod else inj_hook(acc))
                                 lap("forward")
                             finally:
                                 # Restore before unloading, which discards lin.inner
                                 restore_target(target, saved)
                             lap("restore")
+                            inj_rfn = 0.0
+                            if acc[0] is not None:
+                                inj_sq, ref_sq = acc[0].item(), clean_sq.item()
+                                inj_rfn = (inj_sq / ref_sq) ** 0.5 if ref_sq else 0.0
                             pending.append(dict(
                                 res = res, rfn = rfn, rfn_actual = rfn_actual, draw = draw,
-                                w_norm = w_norm, inj_rfn = injected_rfn(states, idx),
+                                w_norm = w_norm, inj_rfn = inj_rfn,
                                 states = states, kld = kld,
                             ))
                             lap("inj")
@@ -1152,6 +1193,7 @@ def main(args):
                     shaping.clear()
                     lap("spawn")
                     unstage_refs()
+                    del spawn_in, clean_out, clean_sq
                 print(f"    time: load wait {runner.take_wait():.2f} s, " +
                       ", ".join(f"{k} {v:.2f} s" for k, v in phase.items()))
 
