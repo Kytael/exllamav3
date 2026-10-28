@@ -81,6 +81,35 @@ def _grouped_mm_supports(device, out_dtype):
     return _grouped_probe[key]
 
 
+class _LoopOrderSum:
+    """Deterministic routed sum in the dense loop's order. The loop adds each expert's rows into the
+    fp32 output one expert at a time, in expert order, and no token repeats within one index_add_,
+    so its result is reproducible. A batched index_add_ over many experts would repeat tokens and
+    add them atomically in arrival order, so the restart control of sc_measure (exactly 0 KL) would
+    not hold. Here each assignment's output goes to its own (token, slot) row, slot = its rank in
+    expert order among the token's assignments, and the slots are added to the output in order:
+    the same fp32 additions in the same order as the loop."""
+
+    def __init__(self, token_sorted, num_tokens, width, device):
+        top_k = token_sorted.numel() // num_tokens
+        # Expert-sorted assignments of one token appear in increasing expert order; a stable sort
+        # by token groups them and keeps that order, and every token has exactly top_k of them
+        by_token = torch.sort(token_sorted, stable = True).indices
+        slot = torch.empty_like(by_token)
+        slot[by_token] = torch.arange(token_sorted.numel(), device = device) % top_k
+        self.row = token_sorted * top_k + slot
+        self.top_k = top_k
+        self.buf = torch.empty((num_tokens * top_k, width), dtype = torch.float, device = device)
+
+    def put(self, values, a0 = 0, a1 = None):
+        self.buf.index_copy_(0, self.row[a0:a1], values)
+
+    def add_to(self, out):
+        buf = self.buf.view(out.shape[0], self.top_k, -1)
+        for k in range(self.top_k):
+            out.add_(buf[:, k])
+
+
 def _bmm(a, b, out_dtype):
     return torch.bmm(a, b) if out_dtype == torch.half else torch.bmm(a, b, out_dtype = out_dtype)
 
@@ -1041,7 +1070,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         del xs
         out = _grouped_mm(a, wd, offs = offs, out_dtype = self.downs[0].inner.out_dtype or torch.half)
         out.mul_(weight_sorted.unsqueeze(1))
-        final_hidden_states.index_add_(0, token_sorted, out)
+        acc = _LoopOrderSum(token_sorted, final_hidden_states.shape[0], final_hidden_states.shape[1], y.device)
+        acc.put(out.float())
+        acc.add_to(final_hidden_states)
 
     def _run_padded_experts(self, y, final_hidden_states, expert_count, token_sorted, weight_sorted,
                             expert_sorted, counts, num_ex):
@@ -1064,6 +1095,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         first = torch.cumsum(cnt, 0) - cnt
         rank = torch.arange(token_sorted.shape[0], device = y.device) - first[expert_sorted]
         per = max(1, MOE_GROUPED_ROWS // cmax)
+        acc = _LoopOrderSum(token_sorted, final_hidden_states.shape[0], final_hidden_states.shape[1], y.device)
         for e0 in range(0, num_ex, per):
             e1 = min(e0 + per, num_ex)
             a0, a1 = starts[e0], starts[e1]
@@ -1088,8 +1120,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             del xp
             d = _bmm(a.view(ne, cmax, -1), wd[e0:e1], od_d).view(ne * cmax, -1).index_select(0, dest)
             d.mul_(weight_sorted[a0:a1].unsqueeze(1))
-            final_hidden_states.index_add_(0, tok, d)
+            acc.put(d.float(), a0, a1)
             del a, u, d
+        acc.add_to(final_hidden_states)
 
     def _batch_recon_layer(self, y):
         """Per-module batched reconstruct state (moe_batch_recon.BatchReconLayer), built on
