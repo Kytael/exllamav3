@@ -101,21 +101,51 @@ class ModuleRunner:
                 mod.unload()
                 g_tensor_cache.drop_all()
 
-    def rows(self, mod, states, capture=None, consume=None, ids=None):
-        """ids: the rows' token ids, passed as params["input_ids"] (PLE layers read the token
-        context from there; without it they run on a dummy all-zero history)"""
-        outputs = []
-        for r, state in enumerate(states):
-            params = {} if capture is None else {"capture": capture}
-            if ids is not None:
-                params["input_ids"] = ids[r]
-            x = mod.prepare_for_device(state.clone(), params)
-            x = mod.forward(x, params)
-            if consume is None:
-                outputs.append(x.to("cpu", copy=True))
-            else:
-                consume(r, x)
-            del x, params
+    def rows(self, mod, states, capture=None, consume=None, ids=None, per_row=False):
+        """states, ids: one entry per row group, (B, ...); ids are the rows' token ids, passed as
+        params["input_ids"] (PLE layers read the token context from there; without it they run on
+        a dummy all-zero history). per_row: forward each row of a group on its own (the LM head,
+        whose full-vocab logits would not fit for a whole group); consume(r, x) then gets the
+        global row index. Without consume, outputs come back as host tensors in page-locked
+        memory: uploads and downloads run asynchronously, the downloads on a copy stream, so a
+        group's transfer overlaps the next group's compute"""
+        dev = getattr(mod, "device", None)
+        on_gpu = dev is not None and torch.device(dev).type == "cuda"
+        copy_stream = torch.cuda.Stream(self.device) if on_gpu and consume is None else None
+        outputs, in_flight = [], []
+        r = 0
+        for g, state in enumerate(states):
+            gid = ids[g] if ids is not None else None
+            parts = [(state[b : b + 1], None if gid is None else gid[b : b + 1]) for b in range(state.shape[0])] \
+                if per_row else [(state, gid)]
+            for st, part_ids in parts:
+                params = {} if capture is None else {"capture": capture}
+                if part_ids is not None:
+                    params["input_ids"] = part_ids
+                # A fresh device copy protects the stored state from in-place edits; a module that
+                # runs on the CPU needs an explicit clone
+                if on_gpu and st.device.type == "cpu" and st.is_floating_point():
+                    x = st.to(self.device, non_blocking = True)
+                else:
+                    x = st.clone()
+                x = mod.prepare_for_device(x, params)
+                x = mod.forward(x, params)
+                if consume is not None:
+                    consume(r, x)
+                elif copy_stream is not None:
+                    out = torch.empty(x.shape, dtype = x.dtype, pin_memory = True)
+                    copy_stream.wait_stream(torch.cuda.current_stream(self.device))
+                    with torch.cuda.stream(copy_stream):
+                        out.copy_(x, non_blocking = True)
+                    in_flight.append(x)
+                    outputs.append(out)
+                else:
+                    outputs.append(x.to("cpu", copy = True))
+                r += st.shape[0]
+                del x, params
+        if copy_stream is not None:
+            copy_stream.synchronize()
+        del in_flight
         return outputs
 
 
@@ -346,7 +376,6 @@ def main(args):
                 groups.append([r])
         return [g[0] if len(g) == 1 else torch.cat(g, dim = 0) for g in groups]
 
-    assert args.batch_rows == 1 or not streaming, "--batch-rows needs resident mode"
     row_groups = make_groups(rows, args.batch_rows)
     cap_states = make_groups(ids[args.rows:], args.batch_rows) if args.shaped else None
     cap_ids = cap_states
@@ -371,11 +400,12 @@ def main(args):
         kl_vocab = min(vocab_size, x.shape[-1], ref.shape[-1])
         x2 = x.reshape(-1, x.shape[-1])
         ref2 = ref.reshape(-1, ref.shape[-1])
-        kl_row = 0.0
+        # fp64 device sum, read once (bit-identical to adding the chunks' Python floats in order)
+        kl_row = torch.zeros((), dtype = torch.float64, device = x.device)
         for a in range(0, x2.shape[0], 256):
             b = min(a + 256, x2.shape[0])
-            kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device, non_blocking = True), kl_vocab).sum().item()
-        return kl_row / x2.shape[0]
+            kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device, non_blocking = True), kl_vocab).sum().double()
+        return kl_row.item() / x2.shape[0]
 
     @torch.inference_mode()
     def forward_rows(start_idx, states, collect_states = False):
@@ -433,14 +463,15 @@ def main(args):
         boundary = [[] for _ in range(num_mods)]
         logits = []
         if streaming:
-            states = rows
+            states = row_groups
             for i in range(num_mods):
                 boundary[i] = states
                 with runner.loaded(i) as mod:
                     states = runner.rows(
-                        mod, states, ids = rows,
+                        mod, states, ids = row_groups,
                         consume=(lambda r, x: logits.append(to_host_pinned(x)))
                         if i == num_mods - 1 else None,
+                        per_row = i == num_mods - 1,
                     )
             return boundary, logits
         for ids_group in row_groups:
@@ -740,6 +771,9 @@ def main(args):
         # fp64 device accumulators, read once (bit-identical to the per-row Python floats)
         inj_sq, ref_sq = None, None
         for st, clean in zip(states, boundary[top_idx + 1]):
+            # Streaming keeps states in host memory: do the arithmetic on the GPU
+            if st.device.type == "cpu":
+                st = st.to(device, non_blocking = True)
             d = st.float() - clean.float().to(st.device)
             di = d.square().sum().double()
             ri = clean.float().square().sum().double().to(di.device)
@@ -807,8 +841,9 @@ def main(args):
                         (None, mean KL) on the last module"""
                         scores = []
                         out = runner.rows(
-                            mod, states, ids = rows,
+                            mod, states, ids = row_groups,
                             consume = (lambda r, x: scores.append(row_kld(r, x))) if last_mod else None,
+                            per_row = last_mod,
                         )
                         return (None, sum(scores) / len(scores)) if last_mod else (out, None)
 
@@ -816,7 +851,8 @@ def main(args):
                     if need_cap:
                         capture = {} if spawn else None
                         cap_states = runner.rows(mod, cap_states, capture = capture, ids = cap_ids,
-                                                 consume = (lambda r, x: None) if last_mod else None)
+                                                 consume = (lambda r, x: None) if last_mod else None,
+                                                 per_row = last_mod)
                         cap_idx += 1
                         if spawn:
                             shaping = finalize_shaping(idx, capture)
@@ -970,7 +1006,7 @@ if __name__ == "__main__":
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
     parser.add_argument("-br", "--batch-rows", dest = "batch_rows", type = int, default = 1,
-                        help = "Resident mode: forward up to N equal-length rows together (the head still runs per row). "
+                        help = "Forward up to N equal-length rows together (the head still runs per row). "
                                "Faster where per-row forwards are launch-bound; costs activation memory. Default: 1")
     parser.add_argument("-rfn", "--rfn", type = str, default = "0.29,0.145", help = "Comma-separated global noise levels (relative weight Frobenius norm)")
     parser.add_argument("-rr", "--rfn_ref", type = str, default = None, help = "Per-tensor noise anchors from sc_rfn_probe.py JSON (overrides --rfn)")
