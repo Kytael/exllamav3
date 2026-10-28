@@ -1101,10 +1101,11 @@ def main(args):
                                                  consume = (lambda r, x: None) if last_mod else None,
                                                  per_row = last_mod)
                         cap_idx += 1
+                        lap("capture")
                         if spawn:
                             shaping = finalize_shaping(idx, capture)
                         del capture
-                        lap("capture")
+                        lap("finalize")
 
                     if last_mod:
                         stage_refs()
