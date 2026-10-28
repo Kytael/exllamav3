@@ -642,12 +642,19 @@ def main(args):
                     boundary[i] = SpilledStates(states, os.path.join(args.spill_dir, f"boundary-{i}"))
                 with runner.loaded(i) as mod:
                     runner.prefetch(i + 1)
+                    old = states
                     states = runner.rows(
                         mod, states, ids = row_groups,
                         consume=(lambda r, x: logits.append(to_host_pinned(x)))
                         if i == num_mods - 1 else None,
                         per_row = i == num_mods - 1,
                     )
+                    if isinstance(boundary[i], SpilledStates) and old:
+                        # Kept on disk: the buffers serve the experiments' states later, as many as
+                        # the pending-state budget can use
+                        per = max(t.numel() * t.element_size() for t in old)
+                        pinned.give(old, keep = sysmem_budget(args.max_sys) // max(per, 1))
+                    del old
             return boundary, logits
         for ids_group in row_groups:
             params = {"input_ids": ids_group}
@@ -1021,6 +1028,19 @@ def main(args):
 
         cap_idx = 0  # next module for capture rows
         for pass_no, members in enumerate(passes):
+            # Every experiment of the pass holds one buffer per row group from its spawn to the
+            # end: register them in the background now (about 1 s per GB) instead of one at a
+            # time as experiments spawn
+            n_exp = sum(measurements_by_idx[i] for i in members)
+            sizes = defaultdict(int)
+            for t in boundary[min(members[0] + 1, num_mods - 1)]:
+                sizes[t.numel() * t.element_size()] += 1
+            if isinstance(boundary[min(members[0] + 1, num_mods - 1)], SpilledStates):
+                sizes = defaultdict(int)
+                for m in boundary[min(members[0] + 1, num_mods - 1)].meta:
+                    sizes[m[3]] += 1
+            for nbytes, k in sizes.items():
+                pinned.reserve(nbytes, k * n_exp)
             # Capture rows stop where the next pass starts, so each module is captured once
             cap_stop = passes[pass_no + 1][0] - 1 if pass_no + 1 < len(passes) else members[-1]
             pending = []
