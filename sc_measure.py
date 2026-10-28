@@ -759,6 +759,7 @@ def main(args):
                 trace = args.trace,
                 h_rows = args.h_rows if args.shaped else None,
                 all_experts_h = args.all_experts_h if args.shaped else None,
+                su_per_qmap = args.su_per_qmap if args.shaped else None,
                 rfn_ref = args.rfn_ref,
                 rfn_scale = args.rfn_scale if args.rfn_ref else None,
                 rfn = None if args.rfn_ref else args.rfn,
@@ -963,6 +964,9 @@ def main(args):
         torch.manual_seed(zlib.crc32(f"su|{top_idx}".encode()) & 0x7fffffff)
         for qmap in list(capture):
             h_data = capture.pop(qmap)
+            if args.su_per_qmap:
+                # Signs independent of which other qmaps were captured before this one
+                torch.manual_seed(zlib.crc32(f"su|{qmap}".encode()) & 0x7fffffff)
             q_fallback, H, L, su, H_diag = finalize_capture_H(h_data, quant_args, False)
             if q_fallback or L is None:
                 print(f" !! q_fallback for {qmap}, using iid noise")
@@ -1305,6 +1309,8 @@ if __name__ == "__main__":
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("--all-experts-h", dest = "all_experts_h", action = "store_true",
                         help = "Shaped mode: capture routed experts' Hessians over every token, as the converter does")
+    parser.add_argument("--su-per-qmap", dest = "su_per_qmap", action = "store_true",
+                        help = "Shaped mode: seed each qmap's random signs from its own name, not the capture order")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
     parser.add_argument("--spill-dir", dest = "spill_dir", type = str, default = None,
                         help = "Streaming: keep boundary states in files under this directory (a fast local disk) "
