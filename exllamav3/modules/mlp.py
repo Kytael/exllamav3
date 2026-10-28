@@ -73,6 +73,7 @@ def capture_out_sensitivity(
     activation_fn: str,
     act_limit: float,
     weights: torch.Tensor | None = None,
+    rows: torch.Tensor | int | None = None,
 ):
     """
     Accumulate, per intermediate channel of a gated MLP, how strongly the MLP's output responds to an error in
@@ -94,7 +95,9 @@ def capture_out_sensitivity(
     slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
     if slopes is None:
         return
-    rows = g.numel() // n
+    # rows: rows that count as samples, a device tensor when some carry zero weight (kept off the
+    # host so the capture never waits on the GPU)
+    rows = g.numel() // n if rows is None else rows
     dn = None
     for linear, c in zip((up, gate), slopes):
         if linear is None or linear.qmap is None:
@@ -112,7 +115,10 @@ def capture_out_sensitivity(
                 "down": dn.to(g.device),
             }
         acc["sum"] += c.double().square().sum(dim = 0)
-        acc["count"] += rows
+        if isinstance(rows, torch.Tensor):
+            acc["count_dev"] = acc.get("count_dev", 0) + rows
+        else:
+            acc["count"] += rows
 
 
 def merge_out_sensitivity(capture: dict, other: dict):
@@ -124,12 +130,16 @@ def merge_out_sensitivity(capture: dict, other: dict):
             m = capture[key]
             m["sum"] += acc["sum"].to(m["sum"].device)
             m["count"] += acc["count"]
+            if "count_dev" in acc:
+                m["count_dev"] = m.get("count_dev", 0) + acc["count_dev"].to(m["sum"].device)
 
 
 def finalize_out_sensitivity(capture: dict) -> dict:
     """Per-channel output sensitivity for every captured Linear, keyed by Linear key, on the CPU"""
+    def count(acc):
+        return acc["count"] + (int(acc["count_dev"]) if "count_dev" in acc else 0)
     return {
-        key: (acc["sum"] / max(acc["count"], 1) * acc["down"]).float().cpu()
+        key: (acc["sum"] / max(count(acc), 1) * acc["down"]).float().cpu()
         for key, acc in capture.items()
     }
 

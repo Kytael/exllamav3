@@ -1711,22 +1711,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                     exp_g = exp_i if self.num_local_experts == self.num_experts \
                                         else exp_i + self.routing_first
                                     sw = sens_weights[top_x, exp_g]
-                                    routed = sw.nonzero().flatten()
-                                    if routed.numel():
-                                        capture_out_sensitivity(
-                                            params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
-                                            self.downs[exp_i], g[routed], u[routed], self.activation_fn,
-                                            self.act_limit, sw[routed]
-                                        )
+                                    # Every row, weighted by its routing weight: rows not routed
+                                    # here add zero, and the routed count stays on the device
+                                    # (selecting them waited on the GPU once per expert)
+                                    capture_out_sensitivity(
+                                        params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
+                                        self.downs[exp_i], g, u, self.activation_fn,
+                                        self.act_limit, sw, rows = (sw != 0).sum()
+                                    )
                                 a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
                                 self.activation_fn_call(g, u, a, self.act_limit)
                             else:
                                 a = self.gateless_act(u)
                                 if a.dtype != torch.half:
                                     a = a.half()
+                            if params.get("capture_discard"):
+                                # All-experts calibration whose output is discarded: the down
+                                # projection only needs its input for H, not its GEMM
+                                self.downs[exp_i].capture_input(a, params)
+                                return None
                             return self.downs[exp_i].forward(a, params)
 
                         current_state = mlp(expert_idx, current_state)
+                        if current_state is None:
+                            start = end
+                            continue
 
                     current_state.mul_(w)
                     final_hidden_states.index_add_(0, top_x, current_state)

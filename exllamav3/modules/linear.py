@@ -655,6 +655,18 @@ class Linear(Module):
             h_data["count"] += rows
 
 
+    def capture_input(self, x: torch.Tensor, params: dict):
+        """Accumulate H from this Linear's (padded) input during calibration, as forward does. A
+        capture split into passes (convert_model.capture_passes) names the qmaps of the current
+        pass; everything else runs without accumulating"""
+        if self.qmap and "capture" in params:
+            if x.shape[-1] < self.in_features:
+                x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
+            pass_qmaps = params.get("capture_qmaps")
+            if pass_qmaps is None or self.qmap in pass_qmaps:
+                self.capture_H(x, params)
+
+
     @override
     def weights_numel(self):
         return self.in_features * self.out_features
@@ -679,12 +691,7 @@ class Linear(Module):
         if x.shape[-1] < self.in_features:
             x = torch.nn.functional.pad(x, (0, self.in_features - x.shape[-1]))
 
-        if self.qmap and "capture" in params:
-            # A capture split into passes (convert_model.capture_passes) names the qmaps of the
-            # current pass; everything else runs without accumulating
-            pass_qmaps = params.get("capture_qmaps")
-            if pass_qmaps is None or self.qmap in pass_qmaps:
-                self.capture_H(x, params)
+        self.capture_input(x, params)
 
         if self.lora_a_tensors:
             lora_input = x

@@ -4,6 +4,7 @@ import time
 import sys
 from .. import Config, Model, Tokenizer
 from ..modules import Linear, Embedding
+from ..modules.transformer import TransformerBlock, ParallelDecoderBlock
 from ..modules.linear import convert_exl3_group
 from ..modules.mlp import merge_out_sensitivity, finalize_out_sensitivity
 from ..modules.quant.exl3_lib.quantize import auto_split, get_temp_buffers
@@ -946,6 +947,14 @@ def capture_passes(module, devices, headroom_min = 1536 << 20, headroom_frac = 0
     return passes
 
 
+def discard_ok(module):
+    """Whether an all-experts capture may skip the routed experts' output (capture_discard). In
+    the standard blocks the MLP output only reaches the residual (through norms and
+    hyperconnection mixing, which hold no quantized Linears), so no Hessian in the module depends
+    on it. Other module types keep the full forward"""
+    return isinstance(module, (TransformerBlock, ParallelDecoderBlock))
+
+
 def capture_module_serial(
     model,
     module,
@@ -976,6 +985,10 @@ def capture_module_serial(
                 "activate_all_experts": model.calibration_all_experts,
                 "input_ids": original_input_ids[i],
             }
+            if model.calibration_all_experts and discard_ok(module):
+                # The all-experts output is never used (the reference state is recomputed with
+                # real routing), so the experts' down projections only capture their inputs
+                params["capture_discard"] = True
             if capture_qmaps is not None:
                 params["capture_qmaps"] = capture_qmaps
             if slicing:
@@ -1053,6 +1066,8 @@ def capture_module_parallel(
                     "activate_all_experts": model.calibration_all_experts,
                     "input_ids": original_input_ids[i],
                 }
+                if model.calibration_all_experts and discard_ok(modules[t_idx]):
+                    params["capture_discard"] = True     # see capture_module_serial
                 if capture_qmaps is not None:
                     params["capture_qmaps"] = capture_qmaps
                 if slicing:
