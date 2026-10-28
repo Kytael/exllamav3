@@ -338,6 +338,18 @@ def main(args):
     mods = model.modules
     num_mods = len(mods)
 
+    def to_host_pinned(x):
+        """fp16 copy of x in page-locked host memory, so later uploads run asynchronously at full
+        link speed (a row's reference logits are length x vocab x 2 bytes: 1 GB at 2,048 tokens
+        and a 248k vocab, uploaded once per perturbed row). Pageable if pinning fails"""
+        x = x.half()
+        try:
+            buf = torch.empty(x.shape, dtype = torch.half, pin_memory = True)
+        except RuntimeError:
+            return x.to("cpu", copy = True)
+        buf.copy_(x)
+        return buf
+
     def row_kld(r, x):
         ref = ref_logits[r]
         kl_vocab = min(vocab_size, x.shape[-1], ref.shape[-1])
@@ -346,7 +358,7 @@ def main(args):
         kl_row = 0.0
         for a in range(0, x2.shape[0], 256):
             b = min(a + 256, x2.shape[0])
-            kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().item()
+            kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device, non_blocking = True), kl_vocab).sum().item()
         return kl_row / x2.shape[0]
 
     @torch.inference_mode()
@@ -378,7 +390,7 @@ def main(args):
             kl_row, n_row = torch.zeros((), dtype = torch.float64, device = x.device), 0
             for a in range(0, x2.shape[0], 256):
                 b = min(a + 256, x2.shape[0])
-                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().double()
+                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device, non_blocking = True), kl_vocab).sum().double()
                 n_row += b - a
             kl_row /= n_row
             kld_sum = kl_row if kld_sum is None else kld_sum.to(kl_row.device) + kl_row
@@ -397,7 +409,7 @@ def main(args):
                 with runner.loaded(i) as mod:
                     states = runner.rows(
                         mod, states, ids = rows,
-                        consume=(lambda r, x: logits.append(x.half().to("cpu", copy=True)))
+                        consume=(lambda r, x: logits.append(to_host_pinned(x)))
                         if i == num_mods - 1 else None,
                     )
             return boundary, logits
@@ -411,7 +423,7 @@ def main(args):
                 # cloned or all mid-stream experiments run on corrupted inputs
                 boundary[i].append(x.clone() if x.is_floating_point() else x)
                 x = mod.forward(x, params)
-            logits.append(x.half().cpu())
+            logits.append(to_host_pinned(x))
         return boundary, logits
 
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
