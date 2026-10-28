@@ -120,9 +120,18 @@ def main(args):
         with safe_open(f, framework = "pt") as h:
             weight_map = {k: "model.safetensors" for k in h.keys()}
 
+    # Decide per tensor before opening anything, so only shards holding kept tensors are read
+    # (a partial download of just those shards is enough)
     by_file = {}
     for name, fname in weight_map.items():
+        if not args.keep_mtp and (name.startswith("mtp.") or ".mtp." in name):
+            continue
+        m = LAYER_RE.match(name)
+        if m and int(m.group(2)) not in remap:
+            continue
         by_file.setdefault(fname, []).append(name)
+    missing = sorted(f for f in by_file if not os.path.exists(os.path.join(src, f)))
+    assert not missing, f"shards with kept tensors are missing: {missing[:5]}"
 
     shard, shard_bytes, shard_no, new_map, total = {}, 0, 0, {}, 0
     def flush():
@@ -139,15 +148,8 @@ def main(args):
     for fname in sorted(by_file):
         with safe_open(os.path.join(src, fname), framework = "pt") as h:
             for name in sorted(by_file[fname]):
-                if not args.keep_mtp and (name.startswith("mtp.") or ".mtp." in name):
-                    continue
                 m = LAYER_RE.match(name)
-                new_name = name
-                if m:
-                    old = int(m.group(2))
-                    if old not in remap:
-                        continue
-                    new_name = f"{m.group(1)}{remap[old]}{m.group(3)}"
+                new_name = f"{m.group(1)}{remap[int(m.group(2))]}{m.group(3)}" if m else name
                 t = slice_tensor(name, h.get_tensor(name), args.experts, old_experts)
                 if t is None:
                     continue
