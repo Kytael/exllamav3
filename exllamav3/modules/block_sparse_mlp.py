@@ -62,6 +62,21 @@ MOE_GROUPED_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 8192))
 MOE_GROUPED_PAD = float(os.environ.get("EXL3_MOE_GROUPED_PAD", 8.0))
 _grouped_mm = getattr(F, "grouped_mm", None) or getattr(torch, "_grouped_mm", None)
 _grouped_reported = set()
+
+# EXL3_MOE_GROUPED_STATS=1: count which path each eligible dense-path call took, and the padding
+# ratio (largest expert's rows x experts / assignments) of each bmm decision, printed at exit
+_grouped_stats = None
+if os.environ.get("EXL3_MOE_GROUPED_STATS", "0") == "1":
+    import atexit
+    _grouped_stats = {"grouped_mm": 0, "bmm": 0, "loop_padding": 0, "pad": []}
+
+    @atexit.register
+    def _print_grouped_stats():
+        pads = sorted(_grouped_stats["pad"])
+        q = lambda f: pads[min(len(pads) - 1, int(f * len(pads)))] if pads else None
+        print(f" -- Grouped MoE stats: grouped_mm {_grouped_stats['grouped_mm']}, bmm {_grouped_stats['bmm']}, "
+              f"loop (padding over {MOE_GROUPED_PAD}x) {_grouped_stats['loop_padding']}; padding ratio "
+              f"p10 {q(0.1)} p50 {q(0.5)} p90 {q(0.9)} max {pads[-1] if pads else None}")
 _grouped_probe = {}
 
 
@@ -1454,8 +1469,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 grouped_counts = None
                 if grouped and self.grouped_backend == "bmm":
                     grouped_counts = expert_count.tolist()
-                    if max(grouped_counts[:num_ex]) * num_ex > MOE_GROUPED_PAD * num_tokens * top_k:
+                    pad = max(grouped_counts[:num_ex]) * num_ex / (num_tokens * top_k)
+                    if pad > MOE_GROUPED_PAD:
                         grouped = False
+                    if _grouped_stats is not None:
+                        _grouped_stats["pad"].append(round(pad, 2))
+                        _grouped_stats["bmm" if grouped else "loop_padding"] += 1
+                elif grouped and _grouped_stats is not None:
+                    _grouped_stats["grouped_mm"] += 1
                 if grouped or (self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows):
                     expert_count_list = None
                 elif grouped_counts is not None:
