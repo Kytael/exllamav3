@@ -18,6 +18,7 @@ from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
 from .moe_batch_recon import PAD_MAX, worst_case_bytes
+from .moe_fp16_decode import MOE_DECODE, MOE_DECODE_MAX_ROWS, MOE_DECODE_GRAPH, HAVE_TRITON, RUNTIME_ON, fp16_moe_decode, GraphSet
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -587,6 +588,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.grouped_w = None
         self.grouped_backend = None
         self.grouped_pending = False
+        self.decode_ok = False
+        self.decode_graphs = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
@@ -989,7 +992,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         """Why the grouped-GEMM expert path can't serve this module (None if it can), from its
         configuration alone. Mirrors what the dense per-expert loop does that the grouped path
         does not: anything outside these conditions keeps the loop"""
-        if not MOE_GROUPED:
+        if not (MOE_GROUPED or MOE_DECODE):
             return "disabled"
         if self.is_quantized or self.bc is not None or self.fused_mode_buffers is not None:
             return "quantized experts"
@@ -1022,6 +1025,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 return f"expert output dtype {out_dtype}"
         dev = self.ups[0].inner.weight.device
         dtypes = {l[0].inner.out_dtype or torch.half for l in ([self.gates] if self.gated else []) + [self.ups, self.downs]}
+        # Sync-free Triton decode path (EXL3_MOE_DECODE=1): needs triton, a matching gate/up output dtype,
+        # row-major (E, in, out) stacks and a CUDA device
+        self.decode_ok = (
+            MOE_DECODE and HAVE_TRITON and torch.device(dev).type == "cuda" and
+            (self.ups[0].inner.out_dtype or torch.half) == ((self.gates[0].inner.out_dtype or torch.half) if self.gated else (self.ups[0].inner.out_dtype or torch.half))
+        )
+        if not MOE_GROUPED:
+            return None if self.decode_ok else "decode path unavailable"
         if _grouped_mm is not None and all(_grouped_mm_supports(dev, d) for d in dtypes):
             self.grouped_backend = "grouped_mm"
         elif all(_bmm_supports(dev, d) for d in dtypes):
@@ -1035,6 +1046,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             _grouped_reported.add(why)
             state = f"on, {self.grouped_backend}" if why is None else "off, " + why
             print(f" -- Grouped MoE experts: {state} ({self.key})")
+        if MOE_DECODE and ("decode", why) not in _grouped_reported:
+            _grouped_reported.add(("decode", why))
+            state = f"on, triton, up to {MOE_DECODE_MAX_ROWS} rows" if why is None and self.decode_ok else \
+                "off, " + (why or "decode path unavailable")
+            print(f" -- Decode MoE experts: {state} ({self.key})")
 
     def _plan_grouped_weights(self):
         """At load: decide whether this module takes the grouped path. The stacking itself waits
@@ -1071,9 +1087,27 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         gw = self.grouped_w
         if gw is None or "capture" in params or "capture_sens" in params:
             return False
+        if self.grouped_backend is None:
+            return False        # stacked for the decode path only
         if y.dtype != torch.half or y.shape[-1] != gw[1].shape[1]:
             return False
         # A weight replaced rather than edited in place (set_weight, swap_cpu) breaks the views
+        return (self.ups[0].inner.weight.data_ptr() == gw[1][0].data_ptr() and
+                self.downs[-1].inner.weight.data_ptr() == gw[2][-1].data_ptr())
+
+    def _decode_eligible(self, y, params, bsz, sens_weights):
+        """Per call: the Triton decode path serves this call (no host sync). Same conditions as the
+        grouped path (stacks exist and back the weights, no per-expert Linear.forward needed), a
+        half input and a row count within EXL3_MOE_DECODE_MAX_ROWS"""
+        if not self.decode_ok or not RUNTIME_ON[0] or bsz > MOE_DECODE_MAX_ROWS or bsz == 0 or sens_weights is not None:
+            return False
+        if self.grouped_pending:
+            self._stack_grouped_weights()
+        gw = self.grouped_w
+        if gw is None or "capture" in params or "capture_sens" in params:
+            return False
+        if y.dtype != torch.half or y.shape[-1] != gw[1].shape[1]:
+            return False
         return (self.ups[0].inner.weight.data_ptr() == gw[1][0].data_ptr() and
                 self.downs[-1].inner.weight.data_ptr() == gw[2][-1].data_ptr())
 
@@ -1321,6 +1355,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_mode_buffers = None
         self.grouped_w = None
         self.grouped_pending = False
+        self.decode_graphs = None
         self.batch_recon = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1443,6 +1478,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
+
+        # Unquantized experts at small row counts (batched decode): fixed-size, sync-free Triton grouped
+        # GEMMs instead of the per-expert loop (moe_fp16_decode.py)
+        elif self._decode_eligible(y, params, bsz, sens_weights):
+            gw = self.grouped_w
+            if MOE_DECODE_GRAPH and self.decode_graphs is None:
+                self.decode_graphs = GraphSet()
+            run_decode = self.decode_graphs.run if MOE_DECODE_GRAPH else fp16_moe_decode
+            final_hidden_states = run_decode(
+                y, selected_experts, routing_weights, gw[0], gw[1], gw[2],
+                self.activation_fn_call if self.gated else None, self.act_limit, self.interm_dtype,
+                self.ups[0].inner.out_dtype or torch.half,
+                (self.gates[0].inner.out_dtype or torch.half) if self.gated else None,
+                self.downs[0].inner.out_dtype or torch.half, self.gated, self.gateless_act,
+            ).reshape(eshape)
 
         # Torch/C++/fused path
         elif (

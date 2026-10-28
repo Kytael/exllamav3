@@ -2,7 +2,9 @@ import sys, os
 
 import argparse
 import json
+import hashlib
 import random
+import time
 import zlib
 
 import torch
@@ -634,16 +636,107 @@ def main(args):
     rows = []
     total_in = total_out = 0
 
+    # Throughput accounting. A decode-only iteration is one with every active job past prefill and
+    # nothing pending: a pure batched single-token step, whose rate is the number to compare
+    conversations = CONVERSATIONS[:args.num_convs] if args.num_convs else CONVERSATIONS
+    st = dict(dec_s = 0.0, dec_tok = 0, dec_iters = 0, dec_bsz = 0, all_s = 0.0, all_tok = 0, it_ms = [])
+
     def total_packed():
         return total_in + total_out
 
+    if args.continuous:
+        # No wave barriers: every (epoch, conversation) is its own state machine. A conversation's
+        # next turn is enqueued the moment its previous response finishes, and up to
+        # --epochs_in_flight epochs run together, so the batch stays full while long responses
+        # finish (a wave runs at the length of its longest job; decode is memory bound and a larger
+        # batch costs little more per step). Per-job seeds are the same as the wave mode's. Rows are
+        # appended in completion order. New work stops at the token target; jobs in flight finish.
+        in_flight = {}            # job identifier (epoch, c_idx, t_idx) -> {"input_ids", "chunks", "eos_reason"}
+        state = {}                # (epoch, c_idx) -> conversation dict
+        epochs_open, next_epoch = [], 0
+        max_turns_c = args.max_turns or 10 ** 9
+
+        def enqueue_turn(epoch, c_idx):
+            conv = state[(epoch, c_idx)]
+            t_idx = conv["t"]
+            conv["messages"].append({"role": "user", "content": conv["turns"][t_idx]})
+            input_ids = tokenizer.hf_chat_template(conv["messages"], add_generation_prompt = True, **TEMPLATE_VARS)
+            ident = (epoch, c_idx, t_idx)
+            generator.enqueue(Job(
+                input_ids = input_ids, max_new_tokens = args.max_new_tokens,
+                stop_conditions = config.eos_token_id_list, decode_special_tokens = True,
+                identifier = ident, seed = zlib.crc32(f"{args.seed}|{epoch}|{c_idx}|{t_idx}".encode()),
+            ))
+            in_flight[ident] = {"input_ids": input_ids, "chunks": [], "eos_reason": None}
+
+        def open_epoch(epoch):
+            for c_idx, (seed_prompt, fu) in enumerate(conversations):
+                state[(epoch, c_idx)] = {"messages": [], "turns": [seed_prompt] + fu, "t": 0}
+                enqueue_turn(epoch, c_idx)
+            epochs_open.append(epoch)
+
+        with ProgressBar("Sampling", target_tokens) as pb:
+            while next_epoch < min(args.epochs_in_flight, args.max_epochs):
+                open_epoch(next_epoch); next_epoch += 1
+            done_in_flight = 0
+            while generator.num_remaining_jobs():
+                act = generator.active_jobs
+                dec_only = bool(act) and not generator.pending_jobs and all(j.is_prefill_done() for j in act)
+                n_act = len(act)
+                it_t0 = time.perf_counter()
+                it_results = generator.iterate()
+                it_dt = time.perf_counter() - it_t0
+                it_tok = sum(r["token_ids"].shape[-1] for r in it_results if r["stage"] == "streaming" and "token_ids" in r)
+                st["all_s"] += it_dt; st["all_tok"] += it_tok
+                if dec_only:
+                    st["dec_s"] += it_dt; st["dec_tok"] += it_tok; st["dec_iters"] += 1
+                    st["dec_bsz"] += n_act; st["it_ms"].append(it_dt * 1000)
+                for result in it_results:
+                    if result["stage"] != "streaming":
+                        continue
+                    ident = result["identifier"]
+                    p = in_flight[ident]
+                    if "token_ids" in result:
+                        p["chunks"].append(result["token_ids"])
+                    if not result["eos"]:
+                        continue
+                    p["eos_reason"] = result.get("eos_reason")
+                    epoch, c_idx, t_idx = ident
+                    conv = state[(epoch, c_idx)]
+                    del in_flight[ident]
+                    response_ids = torch.cat(p["chunks"], dim = -1)[0] if p["chunks"] else torch.empty(0, dtype = torch.long)
+                    if response_ids.numel() == 0:
+                        conv["messages"].pop()
+                        continue
+                    rows.append({
+                        "conversation": c_idx, "turn": t_idx, "epoch": epoch, "eos_reason": p["eos_reason"],
+                        "input_ids": p["input_ids"][0].tolist(), "response_ids": response_ids.tolist(),
+                    })
+                    total_in += p["input_ids"].shape[-1]
+                    total_out += response_ids.numel()
+                    conv["messages"].append({"role": "assistant",
+                                             "content": clean_response_for_context(tokenizer, response_ids)})
+                    conv["t"] += 1
+                    if total_packed() < target_tokens and conv["t"] < len(conv["turns"]) and conv["t"] < max_turns_c:
+                        enqueue_turn(epoch, c_idx)
+                    # Open the next epoch once the oldest open one has no job left
+                    if total_packed() < target_tokens and next_epoch < args.max_epochs and epochs_open and \
+                            not any(k[0] == epochs_open[0] for k in in_flight):
+                        epochs_open.pop(0)
+                        open_epoch(next_epoch); next_epoch += 1
+                    print(f"    epoch {epoch} conv {c_idx:3} turn {t_idx}: {col_yellow}{response_ids.numel():5}{col_default} tokens "
+                          f"({p['eos_reason']})   total {col_green}{total_packed():8,}{col_default}")
+                pb.update(min(total_packed(), target_tokens))
+
     with ProgressBar("Sampling", target_tokens) as pb:
-        for epoch in range(args.max_epochs):
+        for epoch in range(0 if args.continuous else args.max_epochs):
             if total_packed() >= target_tokens:
                 break
             convs = [{"messages": [], "turns": [seed] + fu, "alive": True}
-                     for seed, fu in CONVERSATIONS]
+                     for seed, fu in conversations]
             max_turns = max(len(c["turns"]) for c in convs)
+            if args.max_turns:
+                max_turns = min(max_turns, args.max_turns)
 
             # Turn-major waves: every conversation's turn t runs as one concurrent batch, so a
             # small token target still spreads across all domains, and follow-up turns only need
@@ -671,8 +764,22 @@ def main(args):
 
                 print(f" -- Epoch {epoch}, turn {t_idx}: {col_blue}{len(pending)}{col_default} jobs")
                 wave_tokens = 0
+                wave_t0 = time.perf_counter()
+                wave_new = 0
                 while generator.num_remaining_jobs():
-                    for result in generator.iterate():
+                    act = generator.active_jobs
+                    dec_only = bool(act) and not generator.pending_jobs and all(j.is_prefill_done() for j in act)
+                    n_act = len(act)
+                    it_t0 = time.perf_counter()
+                    it_results = generator.iterate()
+                    it_dt = time.perf_counter() - it_t0
+                    it_tok = sum(r["token_ids"].shape[-1] for r in it_results
+                                 if r["stage"] == "streaming" and "token_ids" in r)
+                    st["all_s"] += it_dt; st["all_tok"] += it_tok
+                    if dec_only:
+                        st["dec_s"] += it_dt; st["dec_tok"] += it_tok; st["dec_iters"] += 1
+                        st["dec_bsz"] += n_act; st["it_ms"].append(it_dt * 1000)
+                    for result in it_results:
                         if result["stage"] != "streaming":
                             continue
                         p = pending[result["identifier"]]
@@ -681,12 +788,16 @@ def main(args):
                         if result["eos"]:
                             p["eos_reason"] = result.get("eos_reason")
                             n_new = sum(c.shape[-1] for c in p["chunks"])
+                            wave_new += n_new
                             wave_tokens += n_new + p["input_ids"].shape[-1]
                             print(f"    conv {result['identifier']:3} turn {t_idx}: "
                                   f"{col_yellow}{n_new:5}{col_default} tokens "
                                   f"({p['eos_reason']})   total "
                                   f"{col_green}{total_packed() + wave_tokens:8,}{col_default}")
                     pb.update(min(total_packed() + wave_tokens, target_tokens))
+                wave_s = time.perf_counter() - wave_t0
+                print(f"TRACEWAVE epoch {epoch} turn {t_idx} jobs {len(pending)} new_tokens {wave_new} "
+                      f"seconds {wave_s:.2f} tok_per_s {wave_new / max(wave_s, 1e-9):.1f}")
 
                 for c_idx, p in pending.items():
                     conv = convs[c_idx]
@@ -716,6 +827,17 @@ def main(args):
     if total_packed() < target_tokens:
         print(f" !! Collected only {total_packed():,} of {target_tokens:,} target tokens after "
               f"{args.max_epochs} epoch(s); consider more epochs or a higher --max_new_tokens")
+
+    ms = sorted(st["it_ms"])
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(json.dumps([r["conversation"], r["turn"], r["epoch"], r["response_ids"]]).encode())
+    print(f"TRACESUM rows {len(rows)} new_tokens {total_out} "
+          f"decode_iters {st['dec_iters']} decode_tokens {st['dec_tok']} decode_s {st['dec_s']:.2f} "
+          f"decode_tok_per_s {st['dec_tok'] / max(st['dec_s'], 1e-9):.1f} "
+          f"mean_bsz {st['dec_bsz'] / max(st['dec_iters'], 1):.1f} "
+          f"step_ms_median {ms[len(ms) // 2] if ms else 0:.1f} step_ms_p90 {ms[9 * len(ms) // 10] if ms else 0:.1f} "
+          f"all_tok_per_s {st['all_tok'] / max(st['all_s'], 1e-9):.1f} hash {h.hexdigest()[:16]}")
 
     # qbench-compatible trace
     out = {
@@ -754,7 +876,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(allow_abbrev = False)
-    model_init.add_args(parser, default_cache_size = 131072, add_draft_model_args = True, default_autosplit_max_batch_size = 32)
+    # Concurrency is bounded by -ambs (recurrent-state slots of the GDN layers: the Generator never runs more
+    # jobs than there are slots) and by -cs (KV tokens shared by all running jobs). Both used to be sized for
+    # 32 jobs / 131k tokens, which capped a 157-conversation wave at 32 concurrent decodes
+    model_init.add_args(parser, default_cache_size = 524288, add_draft_model_args = True, default_autosplit_max_batch_size = 256)
     parser.add_argument("-o", "--output", type = str, required = True, help = "Output trace (JSON, qbench-compatible)")
     parser.add_argument("-co", "--cal_out", type = str, default = None, help = "Output packed calibration rows (safetensors), default: derived from --output")
     parser.add_argument("-cr", "--cal_rows", type = int, default = 250, help = "Calibration rows to pack, default: 250")
@@ -763,5 +888,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_tokens", type = int, default = 3072, help = "Per-turn generation cap, default: 3072")
     parser.add_argument("--max_epochs", type = int, default = 4, help = "Max passes over the seed set (later epochs resample with different seeds), default: 4")
     parser.add_argument("--seed", type = int, default = 0, help = "Base RNG seed (per-job seeds derive from it)")
+    parser.add_argument("--continuous", action = "store_true", help = "No wave barriers: conversations advance independently and epochs overlap (see --epochs_in_flight)")
+    parser.add_argument("--epochs_in_flight", type = int, default = 2, help = "With --continuous: epochs running together, default: 2")
+    parser.add_argument("--num_convs", type = int, default = None, help = "Use only the first N seed conversations (benchmarking: sets the concurrency of a wave)")
+    parser.add_argument("--max_turns", type = int, default = None, help = "Run at most this many turn waves per epoch (benchmarking)")
     parser.add_argument("-tv", "--template_vars", type = json.loads, default = {}, help = 'JSON dict of chat template variables, merged over the defaults')
     main(parser.parse_args())
