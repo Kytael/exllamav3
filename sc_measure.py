@@ -356,7 +356,10 @@ def main(args):
         per row. Returns (mean kld, per-row hidden state after module start_idx if requested).
         Resident mode only.
         """
-        kld_sum = 0.0
+        # KL sums stay on the device in fp64 and are read once per call, not once per 256-token
+        # chunk: each fp32 chunk sum is widened and added in the same order as the Python floats
+        # were, so the result is bit-identical
+        kld_sum = None
         out_states = []
         for r, state in enumerate(states):
             params = {"input_ids": rows[r]}
@@ -372,14 +375,15 @@ def main(args):
             # Chunk over tokens: full-vocab fp32 logits can be GBs
             x2 = x.view(-1, x.shape[-1])
             ref2 = ref.view(-1, ref.shape[-1])
-            kl_row, n_row = 0.0, 0
+            kl_row, n_row = torch.zeros((), dtype = torch.float64, device = x.device), 0
             for a in range(0, x2.shape[0], 256):
                 b = min(a + 256, x2.shape[0])
-                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().item()
+                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device), kl_vocab).sum().double()
                 n_row += b - a
-            kld_sum += kl_row / n_row
+            kl_row /= n_row
+            kld_sum = kl_row if kld_sum is None else kld_sum.to(kl_row.device) + kl_row
             del x
-        return kld_sum / len(states), out_states
+        return kld_sum.item() / len(states), out_states
 
     @torch.inference_mode()
     def ref_pass():
@@ -682,12 +686,18 @@ def main(args):
         """Injected error at the top-level module output, relative to the clean state"""
         if states is None or top_idx + 1 >= num_mods:
             return 0.0
-        inj_sq, ref_sq = 0.0, 0.0
+        # fp64 device accumulators, read once (bit-identical to the per-row Python floats)
+        inj_sq, ref_sq = None, None
         for st, clean in zip(states, boundary[top_idx + 1]):
             d = st.float() - clean.float().to(st.device)
-            inj_sq += d.square().sum().item()
-            ref_sq += clean.float().square().sum().item()
+            di = d.square().sum().double()
+            ri = clean.float().square().sum().double().to(di.device)
+            inj_sq = di if inj_sq is None else inj_sq.to(di.device) + di
+            ref_sq = ri if ref_sq is None else ref_sq.to(di.device) + ri
             del d
+        if inj_sq is None:
+            return 0.0
+        inj_sq, ref_sq = inj_sq.item(), ref_sq.item()
         return (inj_sq / ref_sq) ** 0.5 if ref_sq else 0.0
 
     def record(res, rfn, rfn_actual, draw, kld, inj_rfn, w_norm):
