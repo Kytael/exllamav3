@@ -116,14 +116,84 @@ def capture_out_sensitivity(
             }
         acc["sum"] += c.double().square().sum(dim = 0)
         if isinstance(rows, torch.Tensor):
-            acc["count_dev"] = acc.get("count_dev", 0) + rows
+            if "count_dev" in acc:
+                acc["count_dev"] += rows    # in place: it may be a view (capture_out_sensitivity_experts)
+            else:
+                acc["count_dev"] = rows.clone()
         else:
             acc["count"] += rows
+
+
+def capture_out_sensitivity_experts(
+    capture: dict,
+    layer_key: str,
+    num_experts: int,
+    gates: list,
+    ups: list,
+    downs: list,
+    index: list,
+    g: torch.Tensor,
+    u: torch.Tensor,
+    activation_fn: str,
+    act_limit: float,
+    weights: torch.Tensor,
+):
+    """
+    capture_out_sensitivity for k experts of one layer at once. g, u: (k, rows, intermediate);
+    weights: (k, rows) routing weights, zero for rows not routed to an expert (they add nothing);
+    index: the experts' positions in the layer. Each expert's accumulators are views into one
+    stacked tensor per projection, kept in capture under a private (tuple) key, so a chunk of
+    experts updates them with a few launches instead of a dozen per expert
+    """
+    k, rows, n = g.shape
+    slopes = gated_act_slopes(activation_fn, g.reshape(-1, n), u.reshape(-1, n), act_limit)
+    if slopes is None:
+        return
+    w = weights.float().reshape(-1, 1)
+    counts = (weights != 0).sum(dim = 1)
+    idx = torch.tensor(index, dtype = torch.long, device = g.device)
+    for which, lins, c in (("up", ups, slopes[0]), ("gate", gates, slopes[1])):
+        if lins[0] is None or lins[0].qmap is None:
+            continue
+        c = torch.nan_to_num(c * w, nan = 0.0, posinf = 0.0, neginf = 0.0)
+        sq = c.double().square().view(k, rows, n).sum(dim = 1)
+        skey = ("_experts", layer_key, which)
+        if skey not in capture:
+            capture[skey] = (
+                torch.zeros((num_experts, n), dtype = torch.double, device = g.device),
+                torch.zeros((num_experts,), dtype = torch.long, device = g.device),
+            )
+        sums, cnts = capture[skey]
+        for j, lin in enumerate(lins):
+            if lin.key not in capture:
+                dn = downs[j].inner.get_weight_tensor()[:n].float().square().sum(dim = 1).double()
+                capture[lin.key] = {
+                    "sum": sums[index[j]],
+                    "count": 0,
+                    "count_dev": cnts[index[j]],
+                    "down": dn.to(g.device),
+                    "stacked": True,
+                }
+        if all(capture[lin.key].get("stacked") for lin in lins):
+            sums.index_add_(0, idx, sq)
+            cnts.index_add_(0, idx, counts)
+        else:
+            # Accumulators made by capture_out_sensitivity are not views of the stack
+            for j, lin in enumerate(lins):
+                acc = capture[lin.key]
+                if acc.get("stacked"):
+                    sums[index[j]] += sq[j]
+                    cnts[index[j]] += counts[j]
+                else:
+                    acc["sum"] += sq[j]
+                    acc["count_dev"] = acc.get("count_dev", 0) + counts[j]
 
 
 def merge_out_sensitivity(capture: dict, other: dict):
     """Fold the accumulators of another device's calibration shard into capture"""
     for key, acc in other.items():
+        if isinstance(key, tuple):
+            continue    # stacked storage behind per-key views (capture_out_sensitivity_experts)
         if key not in capture:
             capture[key] = acc
         else:
@@ -141,6 +211,7 @@ def finalize_out_sensitivity(capture: dict) -> dict:
     return {
         key: (acc["sum"] / max(count(acc), 1) * acc["down"]).float().cpu()
         for key, acc in capture.items()
+        if not isinstance(key, tuple)
     }
 
 class MLP(Module):

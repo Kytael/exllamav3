@@ -13,7 +13,7 @@ from .quant import LinearFP16
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
-from .mlp import MLP, GatedMLP, capture_out_sensitivity
+from .mlp import MLP, GatedMLP, capture_out_sensitivity, capture_out_sensitivity_experts
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
@@ -896,6 +896,77 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
 
     @override
+    def _capture_discard_ok(self):
+        """The chunked all-experts capture covers the torch path of gated fp16 experts"""
+        return (
+            (self.bc is None or not self.support_quant_paths) and self.gated and
+            self.interm_dtype == torch.half and self.activation_fn_call is not None and
+            self.num_local_experts == self.num_experts and
+            all(isinstance(l.inner, LinearFP16) and not l.lora_a_tensors for l in self.gates + self.ups)
+        )
+
+    def _capture_discard_experts(self, y, params, sens_weights, expert_count_list, token_sorted,
+                                 min_rows, batched, num_ex, chunk = 8):
+        """
+        All-experts calibration whose output is discarded (capture_discard). Every expert's gate and
+        up GEMMs and every Hessian update run exactly as in the per-expert torch loop, on the same
+        rows in the same order, so every captured H is unchanged. The work between them (output
+        sensitivity, activation) runs once per chunk of experts: the loop issued about 40 small
+        launches per expert and left the GPU waiting on Python
+        """
+        nocap = {k: v for k, v in params.items() if k != "capture"}
+        todo, start = [], 0
+        for e in range(num_ex):
+            count = expert_count_list[e]
+            end = start + count
+            if count > min_rows and e not in batched:
+                todo.append((e, start, end))
+            start = end
+        for c0 in range(0, len(todo), chunk):
+            part = todo[c0 : c0 + chunk]
+            gs, us, sws = [], [], []
+            for e, a0, a1 in part:
+                top_x = token_sorted[a0:a1]
+                xc = y.index_select(0, top_x)
+                # Same order as the loop: up captures then multiplies, then gate
+                self.ups[e].capture_input(xc, params)
+                us.append(self.ups[e].forward(xc, nocap))
+                self.gates[e].capture_input(xc, params)
+                gs.append(self.gates[e].forward(xc, nocap))
+                if sens_weights is not None:
+                    sws.append(sens_weights[top_x, e])
+                del xc
+            counts = {a1 - a0 for _, a0, a1 in part}
+            if len(counts) == 1:
+                g = torch.stack(gs)
+                u = torch.stack(us)
+                del gs, us
+                if sens_weights is not None:
+                    capture_out_sensitivity_experts(
+                        params["capture_sens"], self.key, self.num_experts,
+                        [self.gates[e] for e, _, _ in part], [self.ups[e] for e, _, _ in part],
+                        [self.downs[e] for e, _, _ in part], [e for e, _, _ in part],
+                        g, u, self.activation_fn, self.act_limit, torch.stack(sws),
+                    )
+                k, rows, n = u.shape
+                self.activation_fn_call(g.view(-1, n), u.view(-1, n), u.view(-1, n), self.act_limit)
+                acts = list(u)
+            else:
+                # Uneven row counts (not an all-experts selection): one expert at a time
+                acts = []
+                for j, (e, _, _) in enumerate(part):
+                    if sens_weights is not None:
+                        capture_out_sensitivity(
+                            params["capture_sens"], self.gates[e], self.ups[e], self.downs[e],
+                            gs[j], us[j], self.activation_fn, self.act_limit, sws[j],
+                            rows = (sws[j] != 0).sum()
+                        )
+                    self.activation_fn_call(gs[j], us[j], us[j], self.act_limit)
+                    acts.append(us[j])
+            for (e, _, _), a in zip(part, acts):
+                self.downs[e].capture_input(a, params)
+            del acts
+
     def capture_pass_experts(self, selected_experts: torch.Tensor, routing_weights: torch.Tensor, capture_qmaps):
         """All-experts calibration pass limited to the experts whose down-projection Hessians the
         current capture pass accumulates (the converter splits a module's capture into passes when
@@ -1651,6 +1722,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     self._run_padded_experts(y, final_hidden_states, expert_count, token_sorted,
                                              weight_sorted, flat_expert_local[order], grouped_counts,
                                              num_ex)
+
+                if expert_count_list is not None and params.get("capture_discard") and \
+                        self._capture_discard_ok():
+                    self._capture_discard_experts(y, params, sens_weights, expert_count_list, token_sorted,
+                                                  min_rows, batched, num_ex)
+                    expert_count_list = None
 
                 out_state = None
                 interm = None
