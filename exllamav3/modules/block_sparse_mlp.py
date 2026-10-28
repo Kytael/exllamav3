@@ -8,6 +8,7 @@ from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
+from .quant import LinearFP16
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
@@ -45,6 +46,57 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+# Grouped experts for unquantized MoE (EXL3_MOE_GROUPED=1): the dense path's per-expert Python
+# loop (about ten launches per active expert, after a host sync for the counts) becomes a few
+# batched GEMMs over the expert-sorted rows. The fp16 expert weights are restacked into one
+# (E, in, out) tensor per projection at load and each expert's weight becomes a view into it, so
+# in-place edits (sc_measure's perturb and restore) reach both paths. Two backends:
+#   grouped_mm  no padding and no host sync; needs a torch build that runs fp16 grouped_mm with
+#               each projection's output dtype on this device (torch 2.8: sm_90 only)
+#   bmm         rows padded per expert to the largest expert's count, in chunks of at most
+#               EXL3_MOE_GROUPED_ROWS padded rows; keeps the loop's one host sync for the counts.
+#               Falls back to the loop for a call whose padding exceeds EXL3_MOE_GROUPED_PAD x
+MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") == "1"
+MOE_GROUPED_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 8192))
+MOE_GROUPED_PAD = float(os.environ.get("EXL3_MOE_GROUPED_PAD", 8.0))
+_grouped_mm = getattr(F, "grouped_mm", None) or getattr(torch, "_grouped_mm", None)
+_grouped_reported = set()
+_grouped_probe = {}
+
+
+def _grouped_mm_supports(device, out_dtype):
+    """Whether this torch build runs an fp16 grouped GEMM with a row-major (G, K, N) weight stack,
+    a zero-row group and the given output dtype on this device (cached per device and dtype)"""
+    key = (str(device), out_dtype)
+    if key not in _grouped_probe:
+        try:
+            a = torch.ones((4, 16), dtype = torch.half, device = device)
+            b = torch.ones((3, 16, 16), dtype = torch.half, device = device)
+            offs = torch.tensor([2, 2, 4], dtype = torch.int32, device = device)
+            y = _grouped_mm(a, b, offs = offs, out_dtype = out_dtype)
+            _grouped_probe[key] = bool(y.dtype == out_dtype and (y == 16).all())
+        except Exception:
+            _grouped_probe[key] = False
+    return _grouped_probe[key]
+
+
+def _bmm(a, b, out_dtype):
+    return torch.bmm(a, b) if out_dtype == torch.half else torch.bmm(a, b, out_dtype = out_dtype)
+
+
+def _bmm_supports(device, out_dtype):
+    """Whether torch.bmm does fp16 x fp16 -> out_dtype here (fp32 accumulation either way)"""
+    key = ("bmm", str(device), out_dtype)
+    if key not in _grouped_probe:
+        try:
+            a = torch.ones((3, 2, 16), dtype = torch.half, device = device)
+            b = torch.ones((3, 16, 16), dtype = torch.half, device = device)
+            y = _bmm(a, b, out_dtype)
+            _grouped_probe[key] = bool(y.dtype == out_dtype and (y == 16).all())
+        except Exception:
+            _grouped_probe[key] = False
+    return _grouped_probe[key]
 
 @dataclass
 class FusedBuffers:
@@ -484,6 +536,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.bc_sh_exp = False
         self.fused_mode_buffers = None
+        self.grouped_w = None
+        self.grouped_backend = None
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
@@ -879,7 +933,163 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
+            self._stack_grouped_weights()
 
+
+    def _grouped_static_check(self):
+        """Why the grouped-GEMM expert path can't serve this module (None if it can), from its
+        configuration alone. Mirrors what the dense per-expert loop does that the grouped path
+        does not: anything outside these conditions keeps the loop"""
+        if not MOE_GROUPED:
+            return "disabled"
+        if self.is_quantized or self.bc is not None or self.fused_mode_buffers is not None:
+            return "quantized experts"
+        if (self.num_local_experts or self.num_experts) != self.num_experts:
+            return "expert slice (TP or CPU split)"
+        if self.cpu_split_first is not None or self.cpu_offload:
+            return "CPU experts"
+        if (self.activation_fn_call if self.gated else self.gateless_act) is None:
+            return "activation"
+        for ls in ([self.gates] if self.gated else []) + [self.ups, self.downs]:
+            if len(ls) != self.num_experts:
+                return "expert count"
+            for l in ls:
+                inner = l.inner
+                if not isinstance(inner, LinearFP16):
+                    return "non-fp16 expert"
+                if inner.bias is not None or getattr(inner, "_pinned_store", None) is not None:
+                    return "bias or pinned weight"
+                if l.lora_a_tensors or l.pre_scale != 1.0 or l.post_scale != 1.0 or l.softcap != 0.0:
+                    return "LoRA or scaled output"
+                if l.trim_padded_out and l.out_features != l.out_features_unpadded:
+                    return "trimmed output"
+                if inner.weight.device != ls[0].inner.weight.device:
+                    return "experts on several devices"
+            if len({(tuple(l.inner.weight.shape), l.inner.weight.dtype, l.inner.out_dtype) for l in ls}) != 1 or \
+                    ls[0].inner.weight.dtype != torch.half:
+                return "ragged or non-fp16 experts"
+            out_dtype = ls[0].inner.out_dtype or torch.half
+            if out_dtype not in (torch.half, torch.float):
+                return f"expert output dtype {out_dtype}"
+        dev = self.ups[0].inner.weight.device
+        dtypes = {l[0].inner.out_dtype or torch.half for l in ([self.gates] if self.gated else []) + [self.ups, self.downs]}
+        if _grouped_mm is not None and all(_grouped_mm_supports(dev, d) for d in dtypes):
+            self.grouped_backend = "grouped_mm"
+        elif all(_bmm_supports(dev, d) for d in dtypes):
+            self.grouped_backend = "bmm"
+        else:
+            return "neither grouped_mm nor bmm supports these dtypes here"
+        return None
+
+    def _report_grouped(self, why):
+        if MOE_GROUPED and why not in _grouped_reported:
+            _grouped_reported.add(why)
+            state = f"on, {self.grouped_backend}" if why is None else "off, " + why
+            print(f" -- Grouped MoE experts: {state} ({self.key})")
+
+    @torch.inference_mode()
+    def _stack_grouped_weights(self):
+        """Restack each projection's expert weights into one (E, in, out) tensor and re-point every
+        expert's weight at its slice. Load-time only; the freed per-expert blocks are returned to
+        the driver so the next layer's stack does not grow the cache"""
+        self.grouped_w = None
+        why = self._grouped_static_check()
+        self._report_grouped(why)
+        if why is not None:
+            return
+        def stack(ls):
+            w0 = ls[0].inner.weight
+            st = torch.empty((len(ls),) + tuple(w0.shape), dtype = w0.dtype, device = w0.device)
+            for e, l in enumerate(ls):
+                st[e].copy_(l.inner.weight)
+                l.inner.weight = st[e]
+            return st
+        self.grouped_w = (stack(self.gates) if self.gated else None, stack(self.ups), stack(self.downs))
+        torch.cuda.empty_cache()
+
+    def _grouped_eligible(self, y, params):
+        """Per call: the stacks exist and still back the expert weights, and nothing in params
+        needs per-expert Linear.forward calls (H capture, output-sensitivity capture)"""
+        gw = self.grouped_w
+        if gw is None or "capture" in params or "capture_sens" in params:
+            return False
+        if y.dtype != torch.half or y.shape[-1] != gw[1].shape[1]:
+            return False
+        # A weight replaced rather than edited in place (set_weight, swap_cpu) breaks the views
+        return (self.ups[0].inner.weight.data_ptr() == gw[1][0].data_ptr() and
+                self.downs[-1].inner.weight.data_ptr() == gw[2][-1].data_ptr())
+
+    def _run_grouped_experts(self, y, final_hidden_states, expert_count, token_sorted, weight_sorted,
+                             num_ex):
+        """The dense per-expert loop as three grouped GEMMs: the same fp16 GEMM inputs, the same
+        output dtype per projection as LinearFP16 (gate/up: interm_dtype, down: fp32), the same
+        activation call and the same fp32 index_add_ accumulation. Only the GEMM tiling, and so
+        the summation order inside each dot product, differs"""
+        wg, wu, wd = self.grouped_w
+        offs = torch.cumsum(expert_count[:num_ex], 0, dtype = torch.int32)
+        xs = y.index_select(0, token_sorted)
+        u = _grouped_mm(xs, wu, offs = offs, out_dtype = self.ups[0].inner.out_dtype or torch.half)
+        if self.gated:
+            g = _grouped_mm(xs, wg, offs = offs, out_dtype = self.gates[0].inner.out_dtype or torch.half)
+            a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+            self.activation_fn_call(g, u, a, self.act_limit)
+            del g
+        else:
+            a = self.gateless_act(u)
+            if a.dtype != torch.half:
+                a = a.half()
+        del xs
+        out = _grouped_mm(a, wd, offs = offs, out_dtype = self.downs[0].inner.out_dtype or torch.half)
+        out.mul_(weight_sorted.unsqueeze(1))
+        final_hidden_states.index_add_(0, token_sorted, out)
+
+    def _run_padded_experts(self, y, final_hidden_states, expert_count, token_sorted, weight_sorted,
+                            expert_sorted, counts, num_ex):
+        """The dense per-expert loop as batched GEMMs over rows padded per expert to the largest
+        count (zero rows, never read back), in chunks of experts. Same fp16 inputs, the same output
+        dtype per projection as LinearFP16, the same activation call and fp32 index_add_"""
+        wg, wu, wd = self.grouped_w
+        counts = counts[:num_ex]
+        cmax = max(counts)
+        if cmax == 0:
+            return
+        od_u = self.ups[0].inner.out_dtype or torch.half
+        od_g = (self.gates[0].inner.out_dtype or torch.half) if self.gated else None
+        od_d = self.downs[0].inner.out_dtype or torch.half
+        starts = [0]
+        for c in counts:
+            starts.append(starts[-1] + c)
+        # Row index of each sorted assignment inside its expert's padded block
+        cnt = expert_count[:num_ex]
+        first = torch.cumsum(cnt, 0) - cnt
+        rank = torch.arange(token_sorted.shape[0], device = y.device) - first[expert_sorted]
+        per = max(1, MOE_GROUPED_ROWS // cmax)
+        for e0 in range(0, num_ex, per):
+            e1 = min(e0 + per, num_ex)
+            a0, a1 = starts[e0], starts[e1]
+            if a0 == a1:
+                continue
+            ne = e1 - e0
+            tok = token_sorted[a0:a1]
+            dest = (expert_sorted[a0:a1] - e0) * cmax + rank[a0:a1]
+            xp = y.new_zeros((ne * cmax, y.shape[1]))
+            xp.index_copy_(0, dest, y.index_select(0, tok))
+            xp = xp.view(ne, cmax, -1)
+            u = _bmm(xp, wu[e0:e1], od_u).view(ne * cmax, -1)
+            if self.gated:
+                g = _bmm(xp, wg[e0:e1], od_g).view(ne * cmax, -1)
+                a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
+                self.activation_fn_call(g, u, a, self.act_limit)
+                del g
+            else:
+                a = self.gateless_act(u)
+                if a.dtype != torch.half:
+                    a = a.half()
+            del xp
+            d = _bmm(a.view(ne, cmax, -1), wd[e0:e1], od_d).view(ne * cmax, -1).index_select(0, dest)
+            d.mul_(weight_sorted[a0:a1].unsqueeze(1))
+            final_hidden_states.index_add_(0, tok, d)
+            del a, u, d
 
     def _batch_recon_layer(self, y):
         """Per-module batched reconstruct state (moe_batch_recon.BatchReconLayer), built on
@@ -1022,6 +1232,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
+        self.grouped_w = None
         self.batch_recon = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
@@ -1195,8 +1406,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
                 # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                grouped = self._grouped_eligible(y, params)
+                grouped_counts = None
+                if grouped and self.grouped_backend == "bmm":
+                    grouped_counts = expert_count.tolist()
+                    if max(grouped_counts[:num_ex]) * num_ex > MOE_GROUPED_PAD * num_tokens * top_k:
+                        grouped = False
+                if grouped or (self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows):
                     expert_count_list = None
+                elif grouped_counts is not None:
+                    expert_count_list = grouped_counts
                 else:
                     expert_count_list = expert_count.tolist()
 
@@ -1206,7 +1425,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 groups = []
                 min_rows = 0
                 if expert_count_list is None:
-                    fused_total = num_tokens * top_k
+                    fused_total = 0 if grouped else num_tokens * top_k
                 else:
                     fused_total = 0
                     if self.fused_mode_buffers is not None:
@@ -1331,6 +1550,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 if scratch is not None:
                     ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
                                         tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
+
+                # Grouped GEMM tier: every expert at once (expert_count_list stays None, so the
+                # per-expert loop below runs zero times)
+                if grouped and grouped_counts is None:
+                    self._run_grouped_experts(y, final_hidden_states, expert_count, token_sorted,
+                                              weight_sorted, num_ex)
+                elif grouped:
+                    self._run_padded_experts(y, final_hidden_states, expert_count, token_sorted,
+                                             weight_sorted, flat_expert_local[order], grouped_counts,
+                                             num_ex)
 
                 out_state = None
                 interm = None
