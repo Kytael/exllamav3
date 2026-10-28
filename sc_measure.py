@@ -20,6 +20,26 @@ from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
 from exllamav3.modules.mlp import GatedMLP
 from exllamav3.modules.attn import Attention
 from exllamav3.modules.sliding_attn import SlidingAttention
+from exllamav3.modules.transformer import TransformerBlock, ParallelDecoderBlock
+
+# --all-experts-h: the converter's Hessians for routed experts see every calibration token
+# (activate_all_experts). Under plain routing the experts' shared gate/up H is fed by the first
+# expert to run alone, so shaped noise for expert targets came from one expert's tokens
+all_experts_h = False
+
+
+def capture_forward(mod, x, params):
+    """mod.forward, accumulating H into params["capture"] if present. With all_experts_h, a module
+    holding routed experts first runs the converter's all-experts capture on a copy of x (output
+    discarded), then advances under plain routing without capture"""
+    if all_experts_h and "capture" in params and any(isinstance(m, BlockSparseMLP) for m in mod):
+        cap = dict(params, activate_all_experts = True)
+        if isinstance(mod, (TransformerBlock, ParallelDecoderBlock)):
+            cap["capture_discard"] = True    # see convert_model.discard_ok
+        mod.forward(x.clone(), cap)
+        params = {k: v for k, v in params.items() if k != "capture"}
+    return mod.forward(x, params)
+
 from exllamav3.modules.gated_delta_net import GatedDeltaNet
 from exllamav3.modules.quant.fp16 import LinearFP16
 from exllamav3.modules.quant.exl3_lib.quantize import finalize_capture_H, get_hadamard_dt, had_k
@@ -225,7 +245,7 @@ class ModuleRunner:
             if part_ids is not None:
                 params["input_ids"] = part_ids
             x = mod.prepare_for_device(x, params)
-            x = mod.forward(x, params)
+            x = capture_forward(mod, x, params)
             if inspect is not None:
                 inspect(n, x)
             if consume is not None:
@@ -738,6 +758,7 @@ def main(args):
                 mode = "shaped" if args.shaped else "iid",
                 trace = args.trace,
                 h_rows = args.h_rows if args.shaped else None,
+                all_experts_h = args.all_experts_h if args.shaped else None,
                 rfn_ref = args.rfn_ref,
                 rfn_scale = args.rfn_scale if args.rfn_ref else None,
                 rfn = None if args.rfn_ref else args.rfn,
@@ -925,7 +946,7 @@ def main(args):
             if capture is not None:
                 params["capture"] = capture
             x = mods[top_idx].prepare_for_device(st, params)
-            x = mods[top_idx].forward(x, params)
+            x = capture_forward(mods[top_idx], x, params)
             new_states.append(x)
             del x
         cap_states = new_states
@@ -1282,6 +1303,8 @@ if __name__ == "__main__":
                         help = "Streaming: system RAM for pending fan-out states, in GB (default: half of what is available)")
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
+    parser.add_argument("--all-experts-h", dest = "all_experts_h", action = "store_true",
+                        help = "Shaped mode: capture routed experts' Hessians over every token, as the converter does")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
     parser.add_argument("--spill-dir", dest = "spill_dir", type = str, default = None,
                         help = "Streaming: keep boundary states in files under this directory (a fast local disk) "
@@ -1295,4 +1318,6 @@ if __name__ == "__main__":
     parser.add_argument("-dr", "--draws", type = int, default = 1, help = "Noise draws per level, default: 1")
     parser.add_argument("-t", "--top", type = int, default = 15, help = "Top contributors to print")
     parser.add_argument("-o", "--out", type = str, default = None, help = "Output file (JSON), resumes if present")
-    main(parser.parse_args())
+    args = parser.parse_args()
+    all_experts_h = args.all_experts_h
+    main(args)
