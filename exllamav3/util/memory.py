@@ -593,13 +593,43 @@ def format_vram_report(reports: list[VRAMDeviceReport], color: bool = True, unit
 
 # Host (system) memory guard for large CPU allocations. EXL3_HOST_MEM_RESERVE_MB (default 2048) is
 # kept free on top of the request; 0 disables the check.
+def cgroup_memory_room() -> int | None:
+    """Bytes left under this process's cgroup memory limit, None when there is no limit. In a
+    container /proc/meminfo describes the whole host (a RunPod H100 pod reports 2 TB), while the
+    cgroup limit is what the OOM killer enforces. File pages count against the cgroup but are
+    reclaimable, so they count as room"""
+    for limit_path, usage_path, stat_path, keys in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat",
+         ("active_file", "inactive_file")),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.stat", ("total_active_file", "total_inactive_file")),
+    ):
+        try:
+            limit = open(limit_path).read().strip()
+            if limit == "max" or int(limit) >= 1 << 60:
+                return None
+            usage = int(open(usage_path).read())
+            files = 0
+            for line in open(stat_path):
+                k, v = line.split()
+                if k in keys:
+                    files += int(v)
+            return max(0, int(limit) - usage + files)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def host_memory_available() -> int | None:
-    """Bytes of host memory the kernel considers available, None when unknown"""
+    """Bytes of host memory the kernel considers available (within the cgroup limit, in a
+    container), None when unknown"""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
+                    avail = int(line.split()[1]) * 1024
+                    room = cgroup_memory_room()
+                    return avail if room is None else min(avail, room)
     except OSError:
         pass
     try:
