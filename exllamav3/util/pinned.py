@@ -41,16 +41,8 @@ class PinnedPool:
         self.pending = defaultdict(int)              # nbytes -> buffers a reserve() thread will add
         self.cond = threading.Condition()
 
-    HUGE = True    # back buffers with transparent huge pages when the kernel allows
-
     def _make(self, n):
         mem = _LockedMemory(-1, n)
-        if self.HUGE and hasattr(mmap, "MADV_HUGEPAGE"):
-            # Registering faults in and locks every page; 2 MB pages make that far fewer faults
-            try:
-                mem.madvise(mmap.MADV_HUGEPAGE)
-            except OSError:
-                pass
         ptr = torch.frombuffer(mem, dtype = torch.uint8).data_ptr()
         try:
             cudart = torch.cuda.cudart()
