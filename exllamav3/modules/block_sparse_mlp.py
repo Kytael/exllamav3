@@ -567,6 +567,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.fused_mode_buffers = None
         self.grouped_w = None
         self.grouped_backend = None
+        self.grouped_pending = False
         self.mtile_ok = False
         self.fused_rows = TEMP_ROWS_FUSED
         self.batch_recon = None
@@ -962,7 +963,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
-            self._stack_grouped_weights()
+            self._plan_grouped_weights()
 
 
     def _grouped_static_check(self):
@@ -1016,29 +1017,38 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             state = f"on, {self.grouped_backend}" if why is None else "off, " + why
             print(f" -- Grouped MoE experts: {state} ({self.key})")
 
-    @torch.inference_mode()
-    def _stack_grouped_weights(self):
-        """Restack each projection's expert weights into one (E, in, out) tensor and re-point every
-        expert's weight at its slice. Load-time only; the freed per-expert blocks are returned to
-        the driver so the next layer's stack does not grow the cache"""
+    def _plan_grouped_weights(self):
+        """At load: decide whether this module takes the grouped path. The stacking itself waits
+        for the first forward, because a deferred load fills the weights only after load() returns"""
         self.grouped_w = None
         why = self._grouped_static_check()
         self._report_grouped(why)
-        if why is not None:
-            return
+        self.grouped_pending = why is None
+
+    @torch.inference_mode()
+    def _stack_grouped_weights(self):
+        """Restack each projection's expert weights into one (E, in, out) tensor and re-point every
+        expert at its slice, rebuilding its bound class around the view: the bound class holds its
+        own reference to the weight, so the old tensor would otherwise stay allocated (doubling the
+        experts' memory) and the bound class would not see in-place edits. One projection's stack
+        is the transient; the freed blocks go back to the driver"""
+        self.grouped_pending = False
         def stack(ls):
             w0 = ls[0].inner.weight
             st = torch.empty((len(ls),) + tuple(w0.shape), dtype = w0.dtype, device = w0.device)
             for e, l in enumerate(ls):
                 st[e].copy_(l.inner.weight)
                 l.inner.weight = st[e]
+                l.inner.bc = ext.BC_LinearFP16(l.inner.weight, l.inner.bias)
+            torch.cuda.empty_cache()
             return st
         self.grouped_w = (stack(self.gates) if self.gated else None, stack(self.ups), stack(self.downs))
-        torch.cuda.empty_cache()
 
     def _grouped_eligible(self, y, params):
         """Per call: the stacks exist and still back the expert weights, and nothing in params
         needs per-expert Linear.forward calls (H capture, output-sensitivity capture)"""
+        if self.grouped_pending:
+            self._stack_grouped_weights()
         gw = self.grouped_w
         if gw is None or "capture" in params or "capture_sens" in params:
             return False
@@ -1266,6 +1276,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.fused_mode_buffers = None
         self.grouped_w = None
+        self.grouped_pending = False
         self.batch_recon = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
