@@ -33,6 +33,9 @@ def main(args):
     ids = torch.randint(0, vocab, (args.rows, args.length), generator = gen)
 
     def run(x, params, i):
+        # The head only sees the compared tokens: full-length logits for every row would not fit
+        if i == len(mods) - 1 and x.is_floating_point():
+            x = x[:, : args.head_tokens]
         x = mods[i].prepare_for_device(x, params)
         torch.cuda.synchronize()
         t = time.perf_counter()
@@ -48,8 +51,7 @@ def main(args):
         for i in range(len(mods)):
             x, dt = run(x, params, i)
             t_single[i] += dt
-            keep = x[:, : args.head_tokens] if i == len(mods) - 1 else x
-            single[i].append(keep.float().cpu() if keep.is_floating_point() else keep.cpu())
+            single[i].append(x.float().cpu() if x.is_floating_point() else x.cpu())
 
     # All rows together
     params = {"input_ids": ids}
@@ -61,7 +63,7 @@ def main(args):
         except Exception as e:
             err = f"module {i} ({mods[i].key}): {type(e).__name__}: {e}"[:400]
             break
-        out = x[:, : args.head_tokens] if i == len(mods) - 1 else x
+        out = x
         ref = torch.cat(single[i], dim = 0)
         if out.is_floating_point():
             out = out.float().cpu()
