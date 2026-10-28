@@ -859,6 +859,10 @@ def main(args):
               f"{args.max_epochs} epoch(s); consider more epochs or a higher --max_new_tokens")
 
     ms = sorted(st["it_ms"])
+    if ms:
+        med = ms[len(ms) // 2]
+        slow = [(i, round(v, 1)) for i, v in enumerate(st["it_ms"]) if v > 2 * med]
+        print(f"TRACESLOW {len(slow)} of {len(ms)} decode steps took over twice the median ({med:.1f} ms); first 30 (index, ms): {slow[:30]}")
     h = hashlib.sha256()
     for r in rows:
         h.update(json.dumps([r["conversation"], r["turn"], r["epoch"], r["response_ids"]]).encode())
