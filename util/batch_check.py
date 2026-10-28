@@ -15,6 +15,7 @@ import time
 
 import torch
 from exllamav3 import Config, Model, Tokenizer
+from exllamav3.util.measures import compute_kl_div
 
 
 @torch.inference_mode()
@@ -68,8 +69,15 @@ def main(args):
             m = (out - ref).abs().max().item()
         else:
             d = m = float((out.cpu() != ref).sum())
-        diffs.append(dict(module = i, key = mods[i].key, rel = d, maxabs = m,
-                          single_ms = round(t_single[i] * 1e3, 2), batch_ms = round(t_batch[i] * 1e3, 2)))
+        row = dict(module = i, key = mods[i].key, rel = d, maxabs = m,
+                   single_ms = round(t_single[i] * 1e3, 2), batch_ms = round(t_batch[i] * 1e3, 2))
+        if i == len(mods) - 1 and out.is_floating_point():
+            # What a measurement sees: mean per-token KL(single || batched) over the compared logits
+            v = min(vocab, ref.shape[-1])
+            kl = compute_kl_div(out.reshape(-1, out.shape[-1]).to(device), ref.reshape(-1, ref.shape[-1]).to(device), v)
+            row["kl_mean"] = kl.mean().item()
+            row["kl_max"] = kl.max().item()
+        diffs.append(row)
 
     res = dict(rows = args.rows, length = args.length, error = err, modules = diffs,
                single_total_ms = round(sum(t_single) * 1e3, 1),
