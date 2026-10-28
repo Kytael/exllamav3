@@ -332,7 +332,23 @@ def main(args):
     else:
         ids = list(get_test_tokens(tokenizer, total_rows, args.length).split(1))
     rows = ids[:args.rows]
-    cap_states = ids[args.rows:] if args.shaped else None
+
+    def make_groups(id_rows, size):
+        """Consecutive rows of equal length, at most `size` per group, as (B, length) id tensors.
+        Every pass (reference, control, perturbed, capture) forwards the same groups, so shapes
+        and kernels match between the reference and each measurement and the restart control
+        stays exactly 0. Size 1 is the per-row behaviour"""
+        groups = []
+        for r in id_rows:
+            if groups and len(groups[-1]) < size and groups[-1][-1].shape[1] == r.shape[1]:
+                groups[-1].append(r)
+            else:
+                groups.append([r])
+        return [g[0] if len(g) == 1 else torch.cat(g, dim = 0) for g in groups]
+
+    assert args.batch_rows == 1 or not streaming, "--batch-rows needs resident mode"
+    row_groups = make_groups(rows, args.batch_rows)
+    cap_states = make_groups(ids[args.rows:], args.batch_rows) if args.shaped else None
     cap_ids = cap_states
 
     mods = model.modules
@@ -373,29 +389,43 @@ def main(args):
         # were, so the result is bit-identical
         kld_sum = None
         out_states = []
-        for r, state in enumerate(states):
-            params = {"input_ids": rows[r]}
+        r = 0
+        for g, state in enumerate(states):
+            params = {"input_ids": row_groups[g]}
             x = state.clone() if state.is_floating_point() else state
-            for i in range(start_idx, num_mods):
+            # Every module but the head runs on the whole group
+            for i in range(start_idx, num_mods - 1):
                 mod = mods[i]
                 x = mod.prepare_for_device(x, params)
                 x = mod.forward(x, params)
                 if collect_states and i == start_idx:
                     out_states.append(x.clone())
-            ref = ref_logits[r]
-            kl_vocab = min(vocab_size, x.shape[-1], ref.shape[-1])
-            # Chunk over tokens: full-vocab fp32 logits can be GBs
-            x2 = x.view(-1, x.shape[-1])
-            ref2 = ref.view(-1, ref.shape[-1])
-            kl_row, n_row = torch.zeros((), dtype = torch.float64, device = x.device), 0
-            for a in range(0, x2.shape[0], 256):
-                b = min(a + 256, x2.shape[0])
-                kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(x.device, non_blocking = True), kl_vocab).sum().double()
-                n_row += b - a
-            kl_row /= n_row
-            kld_sum = kl_row if kld_sum is None else kld_sum.to(kl_row.device) + kl_row
+            for xb in head_rows(x, row_groups[g]):
+                ref = ref_logits[r]
+                r += 1
+                kl_vocab = min(vocab_size, xb.shape[-1], ref.shape[-1])
+                # Chunk over tokens: full-vocab fp32 logits can be GBs
+                x2 = xb.view(-1, xb.shape[-1])
+                ref2 = ref.view(-1, ref.shape[-1])
+                kl_row, n_row = torch.zeros((), dtype = torch.float64, device = xb.device), 0
+                for a in range(0, x2.shape[0], 256):
+                    b = min(a + 256, x2.shape[0])
+                    kl_row += compute_kl_div(x2[a:b].float(), ref2[a:b].to(xb.device, non_blocking = True), kl_vocab).sum().double()
+                    n_row += b - a
+                kl_row /= n_row
+                kld_sum = kl_row if kld_sum is None else kld_sum.to(kl_row.device) + kl_row
+                del xb, x2
             del x
-        return kld_sum.item() / len(states), out_states
+        return kld_sum.item() / r, out_states
+
+    def head_rows(x, ids_group):
+        """The last module (the LM head), one row at a time: a group's full-vocab logits would not
+        fit (1 GB per row at 2,048 tokens and a 248k vocab). Yields each row's logits"""
+        head = mods[num_mods - 1]
+        for b in range(x.shape[0]):
+            params = {"input_ids": ids_group[b : b + 1]}
+            xb = head.prepare_for_device(x[b : b + 1], params)
+            yield head.forward(xb, params)
 
     @torch.inference_mode()
     def ref_pass():
@@ -413,17 +443,19 @@ def main(args):
                         if i == num_mods - 1 else None,
                     )
             return boundary, logits
-        for ids_row in rows:
-            params = {"input_ids": ids_row}
-            x = ids_row
-            for i in range(num_mods):
+        for ids_group in row_groups:
+            params = {"input_ids": ids_group}
+            x = ids_group
+            for i in range(num_mods - 1):
                 mod = mods[i]
                 x = mod.prepare_for_device(x, params)
                 # Residual stream is mutated in place downstream; every cached state must be
                 # cloned or all mid-stream experiments run on corrupted inputs
                 boundary[i].append(x.clone() if x.is_floating_point() else x)
                 x = mod.forward(x, params)
-            logits.append(to_host_pinned(x))
+            boundary[num_mods - 1].append(x.clone() if x.is_floating_point() else x)
+            for xb in head_rows(x, ids_group):
+                logits.append(to_host_pinned(xb))
         return boundary, logits
 
     # Collect perturbation targets by top-level module: every quantizable Linear, with each MoE
@@ -642,15 +674,22 @@ def main(args):
         nonlocal cap_states
         new_states = []
         for st, cap_row in zip(cap_states, cap_ids):
+            if top_idx == num_mods - 1:
+                # The head, one row at a time (see head_rows); its outputs are never needed
+                for b in range(st.shape[0]):
+                    params = {"input_ids": cap_row[b : b + 1]}
+                    if capture is not None:
+                        params["capture"] = capture
+                    x = mods[top_idx].prepare_for_device(st[b : b + 1], params)
+                    x = mods[top_idx].forward(x, params)
+                    del x
+                continue
             params = {"input_ids": cap_row}
             if capture is not None:
                 params["capture"] = capture
             x = mods[top_idx].prepare_for_device(st, params)
             x = mods[top_idx].forward(x, params)
-            # Retaining the final module's outputs would hold full-vocab logits for every
-            # capture row; they are never needed
-            if top_idx + 1 < num_mods:
-                new_states.append(x)
+            new_states.append(x)
             del x
         cap_states = new_states
 
@@ -930,6 +969,9 @@ if __name__ == "__main__":
     parser.add_argument("-tr", "--trace", type = str, default = None, help = "Packed self-sampled trace (safetensors from sc_trace.py) to use as eval")
     parser.add_argument("-sh", "--shaped", action = "store_true", help = "LDLQ-shaped noise from captured Hessians (recommended; extra capture pass)")
     parser.add_argument("-hr", "--h_rows", type = int, default = 64, help = "Calibration rows for Hessian capture in shaped mode, default: 64")
+    parser.add_argument("-br", "--batch-rows", dest = "batch_rows", type = int, default = 1,
+                        help = "Resident mode: forward up to N equal-length rows together (the head still runs per row). "
+                               "Faster where per-row forwards are launch-bound; costs activation memory. Default: 1")
     parser.add_argument("-rfn", "--rfn", type = str, default = "0.29,0.145", help = "Comma-separated global noise levels (relative weight Frobenius norm)")
     parser.add_argument("-rr", "--rfn_ref", type = str, default = None, help = "Per-tensor noise anchors from sc_rfn_probe.py JSON (overrides --rfn)")
     parser.add_argument("-rs", "--rfn_scale", type = str, default = "1.0,0.5", help = "Scale factors applied to --rfn_ref anchors, default: 1.0,0.5")
