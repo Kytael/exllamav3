@@ -623,6 +623,7 @@ class Linear(Module):
             "finalized": False,
             "num_total": 0,
             "inf_nan": torch.zeros(2, dtype = torch.long, device = self.device),
+            "dropped": torch.zeros((), dtype = torch.long, device = self.device),   # non-finite rows in count
             "device": self.device,
         }
 
@@ -641,14 +642,17 @@ class Linear(Module):
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
-            # Drop the affected rows; the inf_nan counter above still reports them
+            # Zero the affected rows, which then add nothing, and count them on the device for the
+            # mean: testing for them on the host waited on the GPU once per call, which in an
+            # all-experts capture is once per expert per row. The inf_nan counter above still
+            # reports them
             finite = torch.isfinite(x).all(dim = 1)
-            if not finite.all():
-                x = x[finite]
-                rows = x.shape[0]
+            x = torch.where(finite.unsqueeze(1), x, 0)
+            h_data = params["capture"][self.qmap]
+            h_data["dropped"] += rows - finite.sum()
 
-            accumulate_(params["capture"][self.qmap]["H"], x)
-            params["capture"][self.qmap]["count"] += rows
+            accumulate_(h_data["H"], x)
+            h_data["count"] += rows
 
 
     @override

@@ -1099,6 +1099,8 @@ def capture_module_parallel(
             if qmap not in capture_H:
                 hd["H"] = hd["H"].to(device)
                 hd["inf_nan"] = hd["inf_nan"].to(device)
+                if "dropped" in hd:
+                    hd["dropped"] = hd["dropped"].to(device)
                 hd["device"] = device
                 capture_H[qmap] = hd
             else:
@@ -1107,6 +1109,8 @@ def capture_module_parallel(
                 m["count"] += hd["count"]
                 m["num_total"] += hd["num_total"]
                 m["inf_nan"] += hd["inf_nan"].to(device)
+                if "dropped" in hd:
+                    m["dropped"] = m.get("dropped", 0) + hd["dropped"].to(device)
         cap.clear()
     capture_sens = captures_sens[0]
     for cap in captures_sens[1:]:
