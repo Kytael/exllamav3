@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import os
+import math
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
@@ -54,12 +55,14 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # in-place edits (sc_measure's perturb and restore) reach both paths. Two backends:
 #   grouped_mm  no padding and no host sync; needs a torch build that runs fp16 grouped_mm with
 #               each projection's output dtype on this device (torch 2.8: sm_90 only)
-#   bmm         rows padded per expert to the largest expert's count, in chunks of at most
-#               EXL3_MOE_GROUPED_ROWS padded rows; keeps the loop's one host sync for the counts.
-#               Falls back to the loop for a call whose padding exceeds EXL3_MOE_GROUPED_PAD x
+#   bmm         two tiers, keeping the loop's one host sync for the counts. Experts with at most
+#               EXL3_MOE_GROUPED_LIGHT x the mean row count are padded to that cap and run as batched
+#               GEMMs in chunks of at most EXL3_MOE_GROUPED_ROWS padded rows; the few heavier experts
+#               (real routers are skewed: the busiest expert of a 2,048-token call took 22x its share
+#               on the harness model) run one at a time
 MOE_GROUPED = os.environ.get("EXL3_MOE_GROUPED", "0") == "1"
 MOE_GROUPED_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 8192))
-MOE_GROUPED_PAD = float(os.environ.get("EXL3_MOE_GROUPED_PAD", 8.0))
+MOE_GROUPED_LIGHT = float(os.environ.get("EXL3_MOE_GROUPED_LIGHT", 2.0))
 _grouped_mm = getattr(F, "grouped_mm", None) or getattr(torch, "_grouped_mm", None)
 _grouped_reported = set()
 
@@ -68,15 +71,16 @@ _grouped_reported = set()
 _grouped_stats = None
 if os.environ.get("EXL3_MOE_GROUPED_STATS", "0") == "1":
     import atexit
-    _grouped_stats = {"grouped_mm": 0, "bmm": 0, "loop_padding": 0, "pad": []}
+    _grouped_stats = {"grouped_mm": 0, "bmm": 0, "heavy": [], "pad": []}
 
     @atexit.register
     def _print_grouped_stats():
         pads = sorted(_grouped_stats["pad"])
         q = lambda f: pads[min(len(pads) - 1, int(f * len(pads)))] if pads else None
-        print(f" -- Grouped MoE stats: grouped_mm {_grouped_stats['grouped_mm']}, bmm {_grouped_stats['bmm']}, "
-              f"loop (padding over {MOE_GROUPED_PAD}x) {_grouped_stats['loop_padding']}; padding ratio "
-              f"p10 {q(0.1)} p50 {q(0.5)} p90 {q(0.9)} max {pads[-1] if pads else None}")
+        heavy = sorted(_grouped_stats["heavy"])
+        print(f" -- Grouped MoE stats: grouped_mm {_grouped_stats['grouped_mm']}, bmm {_grouped_stats['bmm']}; "
+              f"busiest expert / mean rows p10 {q(0.1)} p50 {q(0.5)} p90 {q(0.9)} max {pads[-1] if pads else None}; "
+              f"heavy experts per call median {heavy[len(heavy) // 2] if heavy else None} max {heavy[-1] if heavy else None}")
 _grouped_probe = {}
 
 
@@ -1101,13 +1105,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def _run_padded_experts(self, y, final_hidden_states, expert_count, token_sorted, weight_sorted,
                             expert_sorted, counts, num_ex):
-        """The dense per-expert loop as batched GEMMs over rows padded per expert to the largest
-        count (zero rows, never read back), in chunks of experts. Same fp16 inputs, the same output
-        dtype per projection as LinearFP16, the same activation call and fp32 index_add_"""
+        """The dense per-expert loop as batched GEMMs, in two tiers. Light experts (at most
+        EXL3_MOE_GROUPED_LIGHT x the mean row count) are padded to that cap (zero rows, never read
+        back) and run in chunks of experts; heavier experts run one at a time. Same fp16 inputs,
+        the same output dtype per projection as LinearFP16, the same activation call, and the
+        loop's order of fp32 additions"""
         wg, wu, wd = self.grouped_w
         counts = counts[:num_ex]
-        cmax = max(counts)
-        if cmax == 0:
+        total = sum(counts)
+        if total == 0:
             return
         od_u = self.ups[0].inner.out_dtype or torch.half
         od_g = (self.gates[0].inner.out_dtype or torch.half) if self.gated else None
@@ -1115,26 +1121,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         starts = [0]
         for c in counts:
             starts.append(starts[-1] + c)
-        # Row index of each sorted assignment inside its expert's padded block
-        cnt = expert_count[:num_ex]
-        first = torch.cumsum(cnt, 0) - cnt
-        rank = torch.arange(token_sorted.shape[0], device = y.device) - first[expert_sorted]
-        per = max(1, MOE_GROUPED_ROWS // cmax)
+        cap = max(1, min(max(counts), math.ceil(MOE_GROUPED_LIGHT * total / num_ex)))
+        heavy = [e for e in range(num_ex) if counts[e] > cap]
+        if _grouped_stats is not None:
+            _grouped_stats["heavy"].append(len(heavy))
         acc = _LoopOrderSum(token_sorted, final_hidden_states.shape[0], final_hidden_states.shape[1], y.device)
-        for e0 in range(0, num_ex, per):
-            e1 = min(e0 + per, num_ex)
-            a0, a1 = starts[e0], starts[e1]
-            if a0 == a1:
-                continue
-            ne = e1 - e0
-            tok = token_sorted[a0:a1]
-            dest = (expert_sorted[a0:a1] - e0) * cmax + rank[a0:a1]
-            xp = y.new_zeros((ne * cmax, y.shape[1]))
-            xp.index_copy_(0, dest, y.index_select(0, tok))
-            xp = xp.view(ne, cmax, -1)
-            u = _bmm(xp, wu[e0:e1], od_u).view(ne * cmax, -1)
+
+        def mlp(x, e0, e1):
+            """(ne, rows, in) -> (ne, rows, out) through experts e0:e1"""
+            ne, n = x.shape[0], x.shape[1]
+            u = _bmm(x, wu[e0:e1], od_u).view(ne * n, -1)
             if self.gated:
-                g = _bmm(xp, wg[e0:e1], od_g).view(ne * cmax, -1)
+                g = _bmm(x, wg[e0:e1], od_g).view(ne * n, -1)
                 a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
                 self.activation_fn_call(g, u, a, self.act_limit)
                 del g
@@ -1142,11 +1140,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 a = self.gateless_act(u)
                 if a.dtype != torch.half:
                     a = a.half()
+            return _bmm(a.view(ne, n, -1), wd[e0:e1], od_d)
+
+        # Light tier. Heavy experts' rows are sent to a sink row past the padded block and their
+        # slots are overwritten by the heavy tier below
+        cnt = expert_count[:num_ex]
+        first = torch.cumsum(cnt, 0) - cnt
+        rank = torch.arange(token_sorted.shape[0], device = y.device) - first[expert_sorted]
+        light = (cnt[expert_sorted] <= cap) if heavy else None
+        per = max(1, MOE_GROUPED_ROWS // cap)
+        for e0 in range(0, num_ex, per):
+            e1 = min(e0 + per, num_ex)
+            a0, a1 = starts[e0], starts[e1]
+            if a0 == a1 or all(counts[e] > cap or counts[e] == 0 for e in range(e0, e1)):
+                continue
+            ne = e1 - e0
+            tok = token_sorted[a0:a1]
+            dest = (expert_sorted[a0:a1] - e0) * cap + rank[a0:a1]
+            if light is not None:
+                dest = torch.where(light[a0:a1], dest, torch.full_like(dest, ne * cap))
+            xp = y.new_zeros((ne * cap + 1, y.shape[1]))
+            xp.index_copy_(0, dest, y.index_select(0, tok))
+            d = mlp(xp[: ne * cap].view(ne, cap, -1), e0, e1).view(ne * cap, -1)
             del xp
-            d = _bmm(a.view(ne, cmax, -1), wd[e0:e1], od_d).view(ne * cmax, -1).index_select(0, dest)
+            d = d.index_select(0, dest.clamp(max = ne * cap - 1))
             d.mul_(weight_sorted[a0:a1].unsqueeze(1))
             acc.put(d.float(), a0, a1)
-            del a, u, d
+            del d
+
+        # Heavy tier: one expert at a time
+        for e in heavy:
+            a0, a1 = starts[e], starts[e + 1]
+            x = y.index_select(0, token_sorted[a0:a1]).unsqueeze(0)
+            d = mlp(x, e, e + 1)[0]
+            d.mul_(weight_sorted[a0:a1].unsqueeze(1))
+            acc.put(d.float(), a0, a1)
+            del x, d
         acc.add_to(final_hidden_states)
 
     def _batch_recon_layer(self, y):
@@ -1469,12 +1498,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 grouped_counts = None
                 if grouped and self.grouped_backend == "bmm":
                     grouped_counts = expert_count.tolist()
-                    pad = max(grouped_counts[:num_ex]) * num_ex / (num_tokens * top_k)
-                    if pad > MOE_GROUPED_PAD:
-                        grouped = False
                     if _grouped_stats is not None:
-                        _grouped_stats["pad"].append(round(pad, 2))
-                        _grouped_stats["bmm" if grouped else "loop_padding"] += 1
+                        _grouped_stats["pad"].append(round(max(grouped_counts[:num_ex]) * num_ex / (num_tokens * top_k), 2))
+                        _grouped_stats["bmm"] += 1
                 elif grouped and _grouped_stats is not None:
                     _grouped_stats["grouped_mm"] += 1
                 if grouped or (self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows):
