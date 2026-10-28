@@ -761,8 +761,11 @@ def main(args):
         block-Hadamard rotation), with per-output-channel scaling mimicking out_scales,
         normalized to ||dW|| = rfn * ||W||. L is finalize_capture_H's unit-block-lower factor
         (diagonal zeroed) of the rotated, regularized H; solve_triangular treats the unit
-        diagonal implicitly. Two passes with a re-seeded generator avoid holding the full fp32
-        noise tensor (lm_head would be 5 GB).
+        diagonal implicitly. Noise up to NOISE_KEEP_BYTES is made once and kept between the norm
+        and the update; larger noise (lm_head would be 5 GB) is made twice from a re-seeded
+        generator. Returns (saved weights, err_sq, w_sq): fp64 device scalars, so a grouped target
+        of a thousand linears reads them back once (the sums are the same fp64 sums of the same
+        fp32 partials as Python-float accumulation, so the results are bit-identical).
         """
         w = lin.inner.weight                            # (k, n) = (in, out)
         k, n = w.shape
@@ -778,19 +781,17 @@ def main(args):
         rows_per_chunk = max(1, 2 ** 24 // n)
         for a in range(0, k, rows_per_chunk):
             col_sq += w[a : a + rows_per_chunk].float().square().sum(dim = 0)
-        w_sq = col_sq.sum().item()
+        w_sq = col_sq.sum().double()
         col_scale = col_sq.sqrt()
         col_scale /= col_scale.square().mean().sqrt().clamp(min = 1e-20)
         col_scale.clamp_(min = 1e-4)
 
         cols_per_chunk = max(had_k, 2 ** 26 // k)
+        keep = k * n * 4 <= NOISE_KEEP_BYTES
 
-        def noise_chunks(apply_factor):
-            # apply_factor None: accumulate ||dW||^2 only. Else: add scaled noise to w in place.
-            # The generator is re-seeded so both passes see identical noise
+        def noise_chunks():
             gen = torch.Generator(device = w.device)
             gen.manual_seed(seed)
-            total_sq = 0.0
             for a in range(0, n, cols_per_chunk):
                 b = min(a + cols_per_chunk, n)
                 eta = torch.randn((k, b - a), generator = gen, device = w.device, dtype = torch.float)
@@ -799,22 +800,28 @@ def main(args):
                 x = (had_t @ x.view(k // had_k, had_k, b - a)).view(k, b - a)
                 x *= su_col
                 x *= col_scale[a:b].unsqueeze(0)
-                if apply_factor is None:
-                    total_sq += x.square().sum().item()
-                else:
-                    w[:, a:b] = (w[:, a:b].float() + x * apply_factor).to(w.dtype)
-                del x
-            return total_sq
+                yield a, b, x
 
-        dw_sq = noise_chunks(None)
-        factor = rfn * math.sqrt(w_sq / dw_sq)
+        kept = []
+        dw_sq = torch.zeros((), dtype = torch.float64, device = w.device)
+        for a, b, x in noise_chunks():
+            dw_sq += x.square().sum().double()
+            if keep:
+                kept.append((a, b, x))
+            del x
+        factor = rfn * torch.sqrt(w_sq / dw_sq)
         saved = w.clone()
-        noise_chunks(factor)
-        err_sq = 0.0
+        for a, b, x in (kept if keep else noise_chunks()):
+            w[:, a:b] = (w[:, a:b].float() + x * factor).to(w.dtype)
+            del x
+        kept.clear()
+        err_sq = torch.zeros((), dtype = torch.float64, device = w.device)
         for a in range(0, k, rows_per_chunk):
             b = min(a + rows_per_chunk, k)
-            err_sq += (w[a:b].float() - saved[a:b].float()).square().sum().item()
-        return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5
+            err_sq += (w[a:b].float() - saved[a:b].float()).square().sum().double()
+        return saved, err_sq, w_sq
+
+    NOISE_KEEP_BYTES = 1 << 28
 
     SAVED_ON_HOST_BYTES = 1 << 30      # grouped targets park their saved weights in host RAM past this
 
@@ -826,30 +833,45 @@ def main(args):
         _, per = target_rfn(target, li)
         total_bytes = sum(lin.inner.weight.numel() * lin.inner.weight.element_size() for lin in target.linears)
         to_host = target.grouped and total_bytes > SAVED_ON_HOST_BYTES
-        saved, err_sq, w_sq, shaped_all = [], 0.0, 0.0, True
+        saved, sums, shaped_all = [], [], True
         for lin, rfn in zip(target.linears, per):
             seed = zlib.crc32(f"{lin.key}|{li}|{draw}".encode()) & 0x7fffffff
             shape_lin = shaping.get(lin.qmap) if args.shaped else None
             if shape_lin is not None:
                 factors = tuple(t.to(lin.inner.weight.device) for t in shape_lin)
-                sv, rfn_actual, w_norm = perturb_shaped(lin, rfn, seed, *factors)
+                sv, e_sq, l_sq = perturb_shaped(lin, rfn, seed, *factors)
+                sums.append(torch.stack((e_sq, l_sq)))
                 del factors
             else:
                 shaped_all = False
                 sv, rfn_actual, w_norm = perturb_iid(lin, rfn, seed)
+                sums.append((rfn_actual, w_norm))
             if to_host:
-                sv = sv.to("cpu", copy = True)
+                # Page-locked and asynchronous: the copy overlaps the next member's noise
+                host = pinned.empty(sv.shape, sv.dtype)
+                host.copy_(sv, non_blocking = True)
+                sv = host
             saved.append(sv)
+        # One readback for the whole target; then the same Python arithmetic as per-member floats
+        dev = [i for i, x in enumerate(sums) if isinstance(x, torch.Tensor)]
+        if dev:
+            vals = torch.stack([sums[i] for i in dev]).tolist()
+            for i, (e_sq, l_sq) in zip(dev, vals):
+                sums[i] = ((e_sq / l_sq) ** 0.5, l_sq ** 0.5)
+        err_sq, w_sq = 0.0, 0.0
+        for rfn_actual, w_norm in sums:
             err_sq += (rfn_actual * w_norm) ** 2
             w_sq += w_norm ** 2
         if not target.grouped:
-            return saved, rfn_actual, w_norm, shaped_all      # bit-identical to the ungrouped record
+            return (saved, *sums[0], shaped_all)    # bit-identical to the ungrouped record
         return saved, (err_sq / w_sq) ** 0.5, w_sq ** 0.5, shaped_all
 
     @torch.inference_mode()
     def restore_target(target, saved):
         for lin, sv in zip(target.linears, saved):
-            lin.inner.weight.copy_(sv)
+            lin.inner.weight.copy_(sv, non_blocking = True)
+        # Later copies into these buffers queue behind the restores on the same stream
+        pinned.give(saved)
         saved.clear()
 
     @torch.inference_mode()
@@ -895,7 +917,9 @@ def main(args):
                 print(f" !! q_fallback for {qmap}, using iid noise")
                 shaping[qmap] = None
             else:
-                shaping[qmap] = (L.cpu(), su.cpu()) if streaming else (L, su)
+                # On the device even when streaming: every member of a grouped target reads the
+                # same factors, and they live only while this module's experiments spawn
+                shaping[qmap] = (L, su)
             del H, H_diag, L, su, h_data
         return shaping
 
