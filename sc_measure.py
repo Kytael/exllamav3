@@ -1096,11 +1096,14 @@ def main(args):
                     phase = {}
 
                     def lap(name):
+                        """Charge the time since the last lap to name; returns it"""
                         nonlocal t_mod
                         torch.cuda.synchronize(device)
                         t = time.perf_counter()
-                        phase[name] = phase.get(name, 0.0) + t - t_mod
+                        dt = t - t_mod
+                        phase[name] = phase.get(name, 0.0) + dt
                         t_mod = t
+                        return dt
 
                     def run(states, inspect = None):
                         """Forward rows through the loaded module: (states, None), or
@@ -1168,11 +1171,13 @@ def main(args):
                             lap("spawn")
                             saved, rfn_actual, w_norm, shaped_all = perturb_target(target, li, draw, shaping)
                             res["shaped"] = shaped_all
-                            lap("perturb")
+                            t_p = lap("perturb")
                             acc = [None]
                             try:
                                 states, kld = run(spawn_in, inspect = None if last_mod else inj_hook(acc))
-                                lap("forward")
+                                t_f = lap("forward")
+                                print(f"      spawn {target.key[-48:]:48} level {li}: "
+                                      f"perturb {t_p:.2f} s, forward {t_f:.2f} s")
                             finally:
                                 # Restore before unloading, which discards lin.inner
                                 restore_target(target, saved)
