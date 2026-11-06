@@ -242,6 +242,15 @@ def get_test_ids(project: dict, cache: QCache):
         raise ValueError(f"Dataset only provides {len(seqs)} rows of {length} tokens")
     ids = torch.cat(seqs, dim = 0)
 
+    # Per-row BOS. Slicing one long stream leaves every row after the first without a BOS, which
+    # a gemma-lineage model degrades on catastrophically (measured on gemma-4-12B: "The capital of
+    # France is" predicts digits without BOS, " Paris" with it). Set `bos: true` in the project's
+    # tokenizer block when the model expects BOS at the start of a document. The prepended token
+    # is scored like any other, since metrics start at prefix_len
+    if tok.get("bos") and not tok.get("template"):
+        bos = torch.full((ids.shape[0], 1), tokenizer.bos_token_id, dtype = torch.long)
+        ids = torch.cat([bos, ids], dim = 1)
+
     prefix_len = 0
     if tok.get("template"):
         # template: true wraps rows after a bare generation prompt; template: assistant embeds

@@ -703,14 +703,14 @@ class Linear(Module):
 
             # fp16 activation overflow (+-inf) would poison entire rows/columns of H through the
             # accumulation, and no diagonal damping can repair non-finite entries afterwards.
-            # Zero the affected rows, which then add nothing, and count them on the device for the
+            # Drop the affected rows, which then add nothing, and count them on the device for the
             # mean: testing for them on the host waited on the GPU once per call, which in an
             # all-experts capture is once per expert per row. The inf_nan counter above still
             # reports them
             finite = torch.isfinite(x).all(dim = 1)
             row_w = params.get("capture_row_w")
+            h_data = params["capture"][self.qmap]
             if not finite.all():
-                h_data = params["capture"][self.qmap]
                 h_data["dropped"] += rows - finite.sum()
                 x = x[finite]
                 rows = x.shape[0]
@@ -719,6 +719,20 @@ class Linear(Module):
 
             accumulate_(h_data["H"], x)
             h_data["count"] += rows
+
+            # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
+            # conversion/moe_affinity.py), combined with it before quantization. The weights are an
+            # expert's routing weights, so most rows are zero and only the routed ones accumulate
+            if row_w is not None:
+                if "H_aff" not in h_data:
+                    h_data["H_aff"] = torch.zeros_like(h_data["H"])
+                    h_data["aff_sum"] = torch.zeros((), dtype = torch.float, device = h_data["H"].device)
+                row_w = row_w.to(torch.float).clamp_min(0)
+                routed = row_w.nonzero().flatten()
+                if routed.numel():
+                    xw = x[routed] * row_w[routed].sqrt().unsqueeze(1).to(x.dtype)
+                    accumulate_(h_data["H_aff"], xw)
+                    h_data["aff_sum"] += row_w.sum()
 
 
     def capture_input(self, x: torch.Tensor, params: dict):
@@ -731,21 +745,6 @@ class Linear(Module):
             pass_qmaps = params.get("capture_qmaps")
             if pass_qmaps is None or self.qmap in pass_qmaps:
                 self.capture_H(x, params)
-
-            # Row-weighted Hessian alongside the plain one (affinity-weighted expert Hessians, see
-            # conversion/moe_affinity.py), combined with it before quantization. The weights are an
-            # expert's routing weights, so most rows are zero and only the routed ones accumulate
-            if row_w is not None:
-                hd = params["capture"][self.qmap]
-                if "H_aff" not in hd:
-                    hd["H_aff"] = torch.zeros_like(hd["H"])
-                    hd["aff_sum"] = torch.zeros((), dtype = torch.float, device = hd["H"].device)
-                row_w = row_w.to(torch.float).clamp_min(0)
-                routed = row_w.nonzero().flatten()
-                if routed.numel():
-                    xw = x[routed] * row_w[routed].sqrt().unsqueeze(1).to(x.dtype)
-                    accumulate_(hd["H_aff"], xw)
-                    hd["aff_sum"] += row_w.sum()
 
 
     @override
