@@ -46,7 +46,21 @@ HF_ROUTER_KEYS = (".mlp.gate.weight", ".block_sparse_moe.gate.weight", ".router.
 GGUF_ROUTER_KEYS = ("ffn_gate_inp.weight",)
 
 
+_noise_gens = {}
+
+def _noise_gen(dev) -> torch.Generator:
+    """One seeded generator per device: modules with prefer_cpu hand back CPU tensors, so a
+    generator built for the primary device cannot draw their noise."""
+    g = _noise_gens.get(dev)
+    if g is None:
+        g = torch.Generator(device = dev)
+        g.manual_seed(1)
+        _noise_gens[dev] = g
+    return g
+
 def apply_mult_noise(x: torch.Tensor, eps: float, gen: torch.Generator) -> torch.Tensor:
+    if gen is None or gen.device != x.device:
+        gen = _noise_gen(x.device)
     n = torch.randn(x.shape, generator = gen, device = x.device, dtype = torch.float)
     return (x.float() * (1.0 + eps * n)).to(x.dtype)
 
