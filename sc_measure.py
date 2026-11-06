@@ -15,6 +15,7 @@ from exllamav3.util.file import disk_lru_cache
 from exllamav3.util.measures import compute_kl_div
 from exllamav3.util.tensor import g_tensor_cache
 from exllamav3.util.pinned import PinnedPool
+from exllamav3.util.memory import host_memory_available
 from exllamav3.modules.linear import Linear
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
 from exllamav3.modules.mlp import GatedMLP
@@ -345,14 +346,8 @@ def sysmem_budget(max_sys_gb):
     """Pending-state budget in bytes; default to half the RAM available after the reference pass"""
     if max_sys_gb is not None:
         return int(max_sys_gb * 1024 ** 3)
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024 // 2
-    except OSError:
-        pass
-    return 8 * 1024 ** 3
+    avail = host_memory_available()    # within the container's limit, not the host's RAM
+    return avail // 2 if avail is not None else 8 * 1024 ** 3
 
 
 def plan_fanout_passes(measurements_by_idx, state_bytes, budget):
